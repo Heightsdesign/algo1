@@ -8,7 +8,7 @@ def store_top_analysts_data(dataframe):
     Args:
         dataframe (pd.DataFrame): DataFrame containing top analysts data.
     """
-    connection = sqlite3.connect("stock_analysis.db")
+    connection = sqlite3.connect("algo1.db")
     cursor = connection.cursor()
 
     # Insert data into the top_analysts table
@@ -31,7 +31,7 @@ def store_price_target_data(ticker, price_data, price_target_score):
         price_data (dict): Dictionary with price target data.
         price_target_score (int): Calculated price target score.
     """
-    connection = sqlite3.connect("stock_analysis.db")
+    connection = sqlite3.connect("algo1.db")
     cursor = connection.cursor()
 
     cursor.execute("""

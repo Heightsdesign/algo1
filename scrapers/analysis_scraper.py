@@ -1,12 +1,12 @@
 from bs4 import BeautifulSoup
 
-
-def extract_price_targets(driver):
+def extract_price_targets(driver, ticker):
     """
     Extract analyst price targets from the loaded Yahoo Finance analysis page.
 
     Args:
         driver (selenium.webdriver): An active Selenium WebDriver instance with the page loaded.
+        ticker (str): The stock ticker symbol (currently unused but included for clarity).
 
     Returns:
         dict: A dictionary containing extracted price targets (Low, Average, Current, High).

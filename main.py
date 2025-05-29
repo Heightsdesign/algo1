@@ -15,6 +15,7 @@ def create_webdriver():
     return webdriver.Chrome(options=chrome_options)
 
 def process_ticker(ticker):
+    initialize_database() 
     driver = create_webdriver()
 
     try:
@@ -22,16 +23,16 @@ def process_ticker(ticker):
         snapshot_path = take_snapshot(ticker, driver=driver, output_path="snapshots")
 
         # Extract price targets
-        price_targets = extract_price_targets(ticker, driver=driver)
+        price_targets = extract_price_targets(driver, ticker)
         print(f"Price Targets for {ticker}: {price_targets}")
 
-        # Store price target data in database
-        if price_targets:
-            store_price_target_data(ticker, price_targets)
+        # After price_targets is fetched and validated:
+        if price_targets and price_targets["Current"] is not None and price_targets["Average"] is not None:
+            growth_pct = ((price_targets["Average"] - price_targets["Current"]) / price_targets["Current"]) * 100
+            store_price_target_data(ticker, price_targets, growth_pct)
             print(f"Price target data for {ticker} stored.")
         else:
             print(f"No price target data available for {ticker}.")
-
     except Exception as e:
         print(f"Error processing {ticker}: {e}")
 

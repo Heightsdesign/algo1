@@ -128,9 +128,12 @@ def calculate_unrealized_pnl():
     connection.close()
 
 
-if __name__ == "__main__":
+#__________________________________________________________________________________________________________________________________
+
+"""if __name__ == "__main__":
     tickers_to_trade = ["AAPL", "MSFT", "GOOGL"]
 
     enter_trades(tickers_to_trade)
     monitor_and_close_trades()
     calculate_unrealized_pnl()
+"""
