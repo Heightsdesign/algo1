@@ -1,6 +1,6 @@
 from bs4 import BeautifulSoup
 
-def extract_price_targets(driver, ticker):
+def extract_price_targets(ticker, driver):
     """
     Extract analyst price targets from the loaded Yahoo Finance analysis page.
 

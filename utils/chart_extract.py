@@ -21,8 +21,13 @@ def analyze_chart_color_distribution(image_path):
         "Sell": ((0, 100, 100), (20, 255, 255))         # Combines Underperform and Sell (red/orange)
     }
 
-    # Load the image and convert to HSV color space
+    if not os.path.isfile(image_path):
+        raise FileNotFoundError(f"Image file not found: {image_path}")
+
     image = cv2.imread(image_path)
+    if image is None:
+        raise ValueError(f"OpenCV could not open image: {image_path}")
+
     hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
     # Initialize a dictionary to store the pixel counts for each category

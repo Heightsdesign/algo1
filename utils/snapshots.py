@@ -58,3 +58,4 @@ def take_snapshot(ticker, driver, output_path="snapshots"):
         cropped_img.save(snapshot_filename)
 
     print(f"Snapshot saved for {ticker} in {snapshot_filename}.")
+    return snapshot_filename
