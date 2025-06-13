@@ -43,10 +43,17 @@ def store_price_target_data(ticker, price_data, price_target_score):
     connection.close()
     print(f"Price target data for {ticker} stored.")
 
-
 def initialize_database():
     connection = sqlite3.connect("algo1.db")
     cursor = connection.cursor()
+
+    # Create Strategies Table (for documentation/tracking)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS strategies (
+        id INTEGER PRIMARY KEY,
+        description TEXT
+    );
+    """)
 
     # Create Price Targets Table
     cursor.execute("""
@@ -74,7 +81,7 @@ def initialize_database():
     );
     """)
 
-    # Create Open Trades Table
+    # Create Open Trades Table, now with strategy_id
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS open_trades (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,11 +89,13 @@ def initialize_database():
         entry_price REAL NOT NULL,
         stop_loss REAL NOT NULL,
         target_price REAL NOT NULL,
-        date_opened TEXT NOT NULL
+        date_opened TEXT NOT NULL,
+        strategy_id INTEGER,
+        FOREIGN KEY(strategy_id) REFERENCES strategies(id)
     );
     """)
 
-    # Create Closed Trades Table
+    # Create Closed Trades Table, now with strategy_id
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS closed_trades (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,11 +106,13 @@ def initialize_database():
         target_price REAL NOT NULL,
         pnl REAL NOT NULL,
         date_opened TEXT NOT NULL,
-        date_closed TEXT NOT NULL
+        date_closed TEXT NOT NULL,
+        strategy_id INTEGER,
+        FOREIGN KEY(strategy_id) REFERENCES strategies(id)
     );
     """)
 
-    # Table for PnL history
+    # Table for PnL history, now with strategy_id
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS pnl_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,7 +120,9 @@ def initialize_database():
         entry_price REAL,
         current_price REAL,
         pnl_percent REAL,
-        check_date TEXT
+        check_date TEXT,
+        strategy_id INTEGER,
+        FOREIGN KEY(strategy_id) REFERENCES strategies(id)
     );
     """)
 

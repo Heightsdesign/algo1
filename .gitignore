@@ -3,3 +3,4 @@ __pycache__/
 algo1.db
 .idea/
 snapshots/
+.env

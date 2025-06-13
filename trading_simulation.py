@@ -1,41 +1,58 @@
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 import yfinance as yf
+import os
+from dotenv import load_dotenv
+import finnhub
 
+# Load .env file variables into environment
+load_dotenv()                       # looks for .env in current working dir
+
+# Now build the Finnhub client
+finn = finnhub.Client(api_key=os.getenv("FINNHUB_API_KEY"))
 
 def fetch_single_price(ticker):
     """
-    Fetch the current live price of a ticker using yfinance.
-    Args:
-        ticker (str): Stock ticker symbol.
-
-    Returns:
-        float: Current price of the ticker.
+    Fetch latest close price via Finnhub.
     """
     try:
-        stock = yf.Ticker(ticker)
-        current_price = stock.history(period="1d")["Close"].iloc[-1]
-        return current_price
+        quote = finn.quote(ticker)
+        # `c` is current price; if you prefer previous close use `pc`
+        return quote["c"] if quote and quote["c"] else None
     except Exception as e:
-        print(f"Error fetching price for {ticker}: {e}")
+        print(f"[Finnhub] price error {ticker}: {e}")
         return None
+    
+def fetch_open_price(ticker):
+    """
+    Return today's regular-session open from Finnhub.
+    Falls back to the current price if the market has not opened yet.
+    """
+    try:
+        q = finn.quote(ticker)          # same Finnhub client you already build
+        if q and q.get("o"):            # 'o' = session open
+            return q["o"]
+    except Exception as e:
+        print(f"[Finnhub] open error {ticker}: {e}")
 
+    # fallback – behave like before
+    return fetch_single_price(ticker)
 
-def enter_trades(stocks_to_buy):
+def enter_trades(stocks_to_buy, trade_count, strategy_id=None):
     connection = sqlite3.connect("algo1.db")
     cursor = connection.cursor()
 
-    cursor.execute("SELECT COUNT(*) FROM open_trades")
+    cursor.execute("SELECT COUNT(*) FROM open_trades WHERE strategy_id = ?", (strategy_id,))
     open_trade_count = cursor.fetchone()[0]
 
     for ticker in stocks_to_buy:
-        if open_trade_count >= 20:
-            print("Maximum number of open trades reached. Cannot open more positions.")
+        if open_trade_count >= trade_count:
+            print("Maximum number of open trades reached for this strategy. Cannot open more positions.")
             break
 
-        cursor.execute("SELECT 1 FROM open_trades WHERE ticker = ?", (ticker,))
+        cursor.execute("SELECT 1 FROM open_trades WHERE ticker = ? AND strategy_id = ?", (ticker, strategy_id))
         if cursor.fetchone():
-            print(f"Trade already exists for {ticker}. Skipping.")
+            print(f"Trade already exists for {ticker} with this strategy. Skipping.")
             continue
 
         cursor.execute("SELECT average_price FROM price_targets WHERE ticker = ?", (ticker,))
@@ -46,7 +63,7 @@ def enter_trades(stocks_to_buy):
             continue
 
         average_price = result[0]
-        current_price = fetch_single_price(ticker)
+        current_price = fetch_open_price(ticker)
 
         if current_price is None:
             continue
@@ -66,68 +83,96 @@ def enter_trades(stocks_to_buy):
 
         date_opened = datetime.now().strftime("%Y-%m-%d")
         cursor.execute("""
-            INSERT INTO open_trades (ticker, entry_price, stop_loss, target_price, date_opened)
-            VALUES (?, ?, ?, ?, ?)
-        """, (ticker, current_price, stop_loss, target_price, date_opened))
+            INSERT INTO open_trades (ticker, entry_price, stop_loss, target_price, date_opened, strategy_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (ticker, current_price, stop_loss, target_price, date_opened, strategy_id))
         open_trade_count += 1
 
-        print(f"Trade opened for {ticker} at {current_price}. Stop Loss: {stop_loss}, Target Price: {target_price}.")
+        print(f"Trade opened for {ticker} at {current_price}. Stop Loss: {stop_loss}, Target Price: {target_price}, Strategy: {strategy_id}")
 
     connection.commit()
     connection.close()
 
-
-def monitor_and_close_trades():
+def monitor_and_close_trades(strategy_id):
+    """
+    Close a trade if stop-loss or target hit *or* at end-of-day.
+    """
     connection = sqlite3.connect("algo1.db")
-    cursor = connection.cursor()
+    cursor     = connection.cursor()
 
-    cursor.execute("SELECT id, ticker, entry_price, stop_loss, target_price FROM open_trades")
+    cursor.execute("""
+        SELECT id, ticker, entry_price, stop_loss, target_price, date_opened
+        FROM open_trades
+        WHERE strategy_id = ?
+    """, (strategy_id,))
     open_trades = cursor.fetchall()
 
-    for trade_id, ticker, entry_price, stop_loss, target_price in open_trades:
+    for trade_id, ticker, entry_price, stop_loss, target_price, date_opened in open_trades:
         current_price = fetch_single_price(ticker)
         if current_price is None:
+            print(f"[Finnhub] no price for {ticker}; skip.")
             continue
 
+        # close rule 1: stop / target reached intraday
         if current_price <= stop_loss or current_price >= target_price:
-            date_closed = datetime.now().strftime("%Y-%m-%d")
-            cursor.execute("""
-                INSERT INTO closed_trades (ticker, entry_price, exit_price, date_opened, date_closed)
-                SELECT ticker, entry_price, ?, date_opened, ? FROM open_trades WHERE id = ?
-            """, (current_price, date_closed, trade_id))
+            reason = "SL" if current_price <= stop_loss else "TP"
+        else:
+            # close rule 2: end-of-day (we assume function is run after 20:00 NY time)
+            now_utc = datetime.utcnow()
+            ny_close = now_utc.replace(hour=20, minute=30, second=0, microsecond=0)
+            if now_utc < ny_close:
+                # not EOD yet, leave trade open
+                continue
+            reason = "EOD"
 
-            cursor.execute("DELETE FROM open_trades WHERE id = ?", (trade_id,))
+        pnl = (current_price - entry_price) / entry_price * 100
+        date_closed = datetime.now().strftime("%Y-%m-%d")
 
-            print(f"Trade closed for {ticker} at {current_price}.")
+        cursor.execute("""
+            INSERT INTO closed_trades
+              (ticker, entry_price, exit_price, stop_loss, target_price,
+               pnl, date_opened, date_closed, strategy_id)
+            SELECT ticker, entry_price, ?, stop_loss, target_price, ?,
+                   date_opened, ?, strategy_id
+            FROM open_trades WHERE id = ?
+        """, (current_price, pnl, date_closed, trade_id))
+
+        cursor.execute("DELETE FROM open_trades WHERE id = ?", (trade_id,))
+        print(f"Closed {ticker} @ {current_price:.2f}  PnL {pnl:.2f}%  ({reason}, strat {strategy_id})")
+
+        # optional: record to pnl_history
+        cursor.execute("""
+            INSERT INTO pnl_history (ticker, entry_price, current_price,
+                                     pnl_percent, check_date, strategy_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (ticker, entry_price, current_price, pnl, date_closed, strategy_id))
 
     connection.commit()
     connection.close()
-
-
-def calculate_unrealized_pnl():
+# ─────────────────────────────────────────────────────────────
+def calculate_unrealized_pnl(strategy_id):
     connection = sqlite3.connect("algo1.db")
     cursor = connection.cursor()
 
-    cursor.execute("SELECT ticker, entry_price FROM open_trades")
+    cursor.execute("""
+        SELECT ticker, entry_price
+        FROM open_trades
+        WHERE strategy_id = ?
+    """, (strategy_id,))
     open_trades = cursor.fetchall()
 
     total_pnl = 0
-    for ticker, entry_price in open_trades:
-        current_price = fetch_single_price(ticker)
-        if current_price is None:
+    for ticker, entry in open_trades:
+        cur_px = fetch_single_price(ticker)
+        if cur_px is None:
             continue
+        pnl_pct = (cur_px - entry) / entry * 100
+        total_pnl += pnl_pct
+        print(f"{ticker}: Entry {entry:.2f} Cur {cur_px:.2f}  PnL {pnl_pct:.2f}%")
 
-        pnl_percentage = ((current_price - entry_price) / entry_price) * 100
-        total_pnl += pnl_percentage
-
-        print(f"Ticker: {ticker}, Entry Price: {entry_price}, Current Price: {current_price}, PnL: {pnl_percentage:.2f}%")
-
-    average_pnl = total_pnl / len(open_trades) if open_trades else 0
-    print(f"Average Unrealized PnL: {average_pnl:.2f}%")
-
+    avg_pnl = total_pnl / len(open_trades) if open_trades else 0
+    print(f"Avg Unrealized PnL (strategy {strategy_id}): {avg_pnl:.2f}%")
     connection.close()
-
-
 #__________________________________________________________________________________________________________________________________
 
 """if __name__ == "__main__":
