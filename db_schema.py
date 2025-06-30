@@ -90,6 +90,7 @@ def initialize_database():
         stop_loss REAL NOT NULL,
         target_price REAL NOT NULL,
         date_opened TEXT NOT NULL,
+        trailing_stop REAL,
         strategy_id INTEGER,
         FOREIGN KEY(strategy_id) REFERENCES strategies(id)
     );

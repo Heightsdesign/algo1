@@ -44,7 +44,7 @@ def fetch_top_stocks(n=30, descending=True):
         SELECT ticker, analyst_avg_score, price_target_score, date
         FROM scores
         WHERE year_month = ?
-        ORDER BY (analyst_avg_score * 0.6 + price_target_score * 0.4) {order}
+        ORDER BY (analyst_avg_score * 0.5 + price_target_score * 0.5) {order}
         LIMIT ?
     """, (year_month, n))
 
