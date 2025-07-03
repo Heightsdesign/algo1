@@ -5,6 +5,9 @@ import os
 import finnhub
 import pandas as pd
 from dotenv import load_dotenv
+import sqlite3, datetime, pytz
+
+EASTERN = pytz.timezone("US/Eastern")
 
 
 # Load .env file variables into environment
@@ -282,6 +285,21 @@ def calculate_unrealized_pnl(strategy_id):
 
     avg = total / len(rows) if rows else 0
     print(f"Avg PnL (strategy {strategy_id}): {avg:+.2f}%")
+    conn.commit()
+    conn.close()
+
+
+def queue_trades(tickers, strategy_id, db="algo1.db"):
+    ts = datetime.datetime.now(EASTERN).isoformat(timespec="seconds")
+    conn = sqlite3.connect(db)
+    cur  = conn.cursor()
+    for tk in tickers:
+        cur.execute("""
+            INSERT INTO open_trades
+              (ticker, entry_price, stop_loss, target_price,
+               shares, side, executed, date_opened, strategy_id)
+            VALUES (?, 0, 0, 0, NULL, 'LONG', 0, ?, ?)
+            """, (tk, ts, strategy_id))
     conn.commit()
     conn.close()
 #__________________________________________________________________________________________________________________________________

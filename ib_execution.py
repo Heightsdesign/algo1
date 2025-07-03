@@ -108,54 +108,80 @@ def get_net_liq(ib: IB) -> float:
 # ---------------------------------------------------------------------------
 # Execution core
 # ---------------------------------------------------------------------------
+def execute_strategy(strategy_id: int, *, live: bool = False,
+                     leverage: float | None = None,
+                     even_bet: bool | None = None,
+                     fixed_dollars: float | None = None):
+    """
+    Send market (or notional cashQty) orders for all pending rows of
+    `strategy_id` at the market open.  If the broker rejects cashQty, the
+    function retries with fractional share sizing.
+    """
 
-def execute_strategy(strategy_id: int, *, live: bool = False, leverage: float | None = None,
-                     even_bet: bool | None = None, fixed_dollars: float | None = None):
+    even_bet      = EVEN_BET        if even_bet      is None else even_bet
+    leverage      = LEVERAGE_FACTOR if leverage      is None else leverage
+    fixed_dollars = FIXED_DOLLARS   if fixed_dollars is None else fixed_dollars
 
-    even_bet = EVEN_BET if even_bet is None else even_bet
-    leverage = LEVERAGE_FACTOR if leverage is None else leverage
-    fixed_dollars = FIXED_DOLLARS if fixed_dollars is None else fixed_dollars
-
-    conn = get_conn()
-    pending = fetch_pending(conn, strategy_id)
+    conn     = get_conn()
+    pending  = fetch_pending(conn, strategy_id)
     if not pending:
         print("No trades to execute.")
+        conn.close()
         return
 
     wait_for_open()
     ib = connect_ib(live)
 
     try:
+        # allocation for notional sizing
+        alloc = fixed_dollars
         if even_bet and fixed_dollars == 0:
             net_liq = get_net_liq(ib)
-            alloc = (net_liq * leverage) / len(pending)
-            print(f"NetLiq ${net_liq:,.2f} · leverage {leverage} ⇒ ${alloc:,.2f} each position")
-        else:
-            alloc = fixed_dollars  # may still be 0
+            alloc   = (net_liq * leverage) / len(pending)
+            print(f"NetLiq ${net_liq:,.2f} · leverage {leverage} "
+                  f"⇒ ${alloc:,.2f} each position")
 
         for row in pending:
-            side  = row["side"].upper()
-            act   = "BUY" if side == "LONG" else "SELL"
-            sym   = row["ticker"]
+            side = (row.get("side") or "LONG").upper()
+            act  = "BUY" if side == "LONG" else "SELL"
+            sym  = row["ticker"]
 
             contract = Stock(sym, "SMART", "USD")
             ib.qualifyContracts(contract)
 
+            # 1ᵗ attempt: cash-quantity order
             if even_bet:
                 order = MarketOrder(act, 0)
                 order.cashQty = round(alloc, 2)
             else:
-                qty = int(row["shares"] or 0)
+                qty = int(row.get("shares") or 0)
                 if qty <= 0:
                     print(f"⚠ {sym}: shares not specified – skipping")
                     continue
                 order = MarketOrder(act, qty)
 
-            print(f"{act} {sym} ${getattr(order, 'cashQty', order.totalQuantity)} – sending…")
+            print(f"{act} {sym} … sending")
             trade = ib.placeOrder(contract, order)
             while not trade.isDone():
                 ib.sleep(0.3)
-            fill = trade.filledAvgPrice or 0
+
+            # fallback to fractional shares if cashQty rejected
+            if (even_bet and trade.orderStatus.status == "Cancelled"
+                    and "Cash Quantity" in (trade.log[-1].message or "")):
+                quote = ib.reqMktData(contract, "", False, False)
+                ib.sleep(1)
+                last = quote.last or quote.close
+                if not last:
+                    print(f"⚠ No quote for {sym}; skip.")
+                    continue
+                qty = round(alloc / last, 3)
+                order = MarketOrder(act, qty)
+                print(f"Retry {sym} qty {qty} …")
+                trade = ib.placeOrder(contract, order)
+                while not trade.isDone():
+                    ib.sleep(0.3)
+
+            fill = trade.orderStatus.avgFillPrice or 0.0
             print(f"{sym} filled {fill:.2f}")
             mark_filled(conn, row["id"], fill)
 
@@ -163,10 +189,6 @@ def execute_strategy(strategy_id: int, *, live: bool = False, leverage: float | 
         ib.disconnect()
         conn.close()
         print("Completed execution.")
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import argparse

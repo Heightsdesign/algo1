@@ -81,34 +81,40 @@ def initialize_database():
     );
     """)
 
-    # Create Open Trades Table, now with strategy_id
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS open_trades (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ticker TEXT NOT NULL,
-        entry_price REAL NOT NULL,
-        stop_loss REAL NOT NULL,
-        target_price REAL NOT NULL,
-        date_opened TEXT NOT NULL,
-        trailing_stop REAL,
-        strategy_id INTEGER,
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker          TEXT    NOT NULL,
+        entry_price     REAL    NOT NULL,
+        stop_loss       REAL    NOT NULL,
+        target_price    REAL    NOT NULL,
+        shares          INTEGER,            -- NEW: optional fixed-share sizing
+        trailing_stop   REAL,               -- ATR trail
+        executed        INTEGER DEFAULT 0,  -- 0 = not sent to IB, 1 = filled
+        execution_price REAL,
+        execution_time  TEXT,
+        date_opened     TEXT    NOT NULL,
+        strategy_id     INTEGER,
+        side            TEXT DEFAULT 'LONG',
+        executed        INTEGER DEFAULT 0,
         FOREIGN KEY(strategy_id) REFERENCES strategies(id)
     );
     """)
 
-    # Create Closed Trades Table, now with strategy_id
+    # ── Closed Trades (archive) ─────────────────────────────────────────────
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS closed_trades (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ticker TEXT NOT NULL,
-        entry_price REAL NOT NULL,
-        exit_price REAL NOT NULL,
-        stop_loss REAL NOT NULL,
-        target_price REAL NOT NULL,
-        pnl REAL NOT NULL,
-        date_opened TEXT NOT NULL,
-        date_closed TEXT NOT NULL,
-        strategy_id INTEGER,
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker          TEXT    NOT NULL,
+        entry_price     REAL    NOT NULL,
+        stop_loss       REAL    NOT NULL,
+        target_price    REAL    NOT NULL,
+        exit_price      REAL    NOT NULL,
+        pnl             REAL    NOT NULL,
+        date_opened     TEXT    NOT NULL,
+        date_closed     TEXT    NOT NULL,
+        strategy_id     INTEGER,
+        exit_reason     TEXT,               -- e.g. 'EOD', 'ATRStop'
         FOREIGN KEY(strategy_id) REFERENCES strategies(id)
     );
     """)
