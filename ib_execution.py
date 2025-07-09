@@ -105,6 +105,38 @@ def get_net_liq(ib: IB) -> float:
             return float(tag.value)
     raise RuntimeError("NetLiquidation not found in account summary")
 
+def last_trade_price(ib: IB, contract: Contract) -> float | None:
+    """
+    Try a few inexpensive ways to get a tradable price.
+    Returns None if nothing works within ~2 s.
+    """
+    # 1️⃣ snapshot quote (fast, free)
+    ticker = ib.reqTickers(contract)
+    if ticker and (p := ticker[0].marketPrice()) and p > 0:
+        return p
+
+    # 2️⃣ delayed quote (works even without real-time data)
+    ib.reqMarketDataType(4)          # 4 = delayed/frozen
+    ticker = ib.reqTickers(contract)
+    if ticker and (p := ticker[0].marketPrice()) and p > 0:
+        return p
+
+    # 3️⃣ 1-bar historical close (always available, but costs an extra call)
+    bar = ib.reqHistoricalData(
+        contract,
+        endDateTime="",
+        durationStr="1 D",
+        barSizeSetting="1 day",
+        whatToShow="TRADES",
+        useRTH=True,
+        formatDate=1,
+        keepUpToDate=False,
+        timeout=2,
+    )
+    if bar:
+        return bar[-1].close
+    return None
+
 # ---------------------------------------------------------------------------
 # Execution core
 # ---------------------------------------------------------------------------
@@ -142,48 +174,36 @@ def execute_strategy(strategy_id: int, *, live: bool = False,
                   f"⇒ ${alloc:,.2f} each position")
 
         for row in pending:
-            side = (row.get("side") or "LONG").upper()
+            side = row["side"].upper()
             act  = "BUY" if side == "LONG" else "SELL"
             sym  = row["ticker"]
 
             contract = Stock(sym, "SMART", "USD")
             ib.qualifyContracts(contract)
 
-            # 1ᵗ attempt: cash-quantity order
             if even_bet:
-                order = MarketOrder(act, 0)
-                order.cashQty = round(alloc, 2)
+                price = last_trade_price(ib, contract)
+                if price is None:
+                    print(f"⚠ {sym}: no price, skipping.")
+                    continue
+                qty = round(alloc / price, 3)
             else:
-                qty = int(row.get("shares") or 0)
+                qty = float(row["shares"] or 0)
                 if qty <= 0:
                     print(f"⚠ {sym}: shares not specified – skipping")
                     continue
-                order = MarketOrder(act, qty)
 
-            print(f"{act} {sym} … sending")
-            trade = ib.placeOrder(contract, order)
+            print(f"{act} {sym} qty {qty} @≈{price:.2f} – sending")
+            order  = MarketOrder(act, qty)
+            trade  = ib.placeOrder(contract, order)
             while not trade.isDone():
-                ib.sleep(0.3)
-
-            # fallback to fractional shares if cashQty rejected
-            if (even_bet and trade.orderStatus.status == "Cancelled"
-                    and "Cash Quantity" in (trade.log[-1].message or "")):
-                quote = ib.reqMktData(contract, "", False, False)
-                ib.sleep(1)
-                last = quote.last or quote.close
-                if not last:
-                    print(f"⚠ No quote for {sym}; skip.")
-                    continue
-                qty = round(alloc / last, 3)
-                order = MarketOrder(act, qty)
-                print(f"Retry {sym} qty {qty} …")
-                trade = ib.placeOrder(contract, order)
-                while not trade.isDone():
-                    ib.sleep(0.3)
+                ib.sleep(0.25)
 
             fill = trade.orderStatus.avgFillPrice or 0.0
-            print(f"{sym} filled {fill:.2f}")
-            mark_filled(conn, row["id"], fill)
+            status = trade.orderStatus.status
+            print(f"{sym} {status} {fill:.2f}")
+            if status == "Filled":
+                mark_filled(conn, row["id"], fill)
 
     finally:
         ib.disconnect()

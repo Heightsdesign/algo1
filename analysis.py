@@ -20,7 +20,17 @@ def analyze_market_sentiment(filtered, top_n, lookback_days, min_positive=15):
 
     return filtered_stocks, ranked_stocks
 
-def run_analysis_and_trades(strategy, top_n=20, trade_count=20, lookback_days=31, min_positive=15, use_filtered=True, open_new=True, do_monitor=True, queue_only=False):
+def run_analysis_and_trades(strategy,
+                            top_n=20,
+                            trade_count=20,
+                            lookback_days=31,
+                            min_positive=15,
+                            use_filtered=True,
+                            open_new=True,
+                            do_monitor=True,
+                            queue_only=False,
+                            analysis_only=False):
+    
     filtered_stocks, ranked_stocks = analyze_market_sentiment(use_filtered, top_n, lookback_days, min_positive)
 
     # Decide which set of stocks to use
@@ -32,6 +42,9 @@ def run_analysis_and_trades(strategy, top_n=20, trade_count=20, lookback_days=31
 
     stocks = stocks[:trade_count]
     print(f"Entering trades for strategy {strategy} ({'filtered' if use_filtered else 'ranked'} set)")
+
+    if analysis_only:
+        return
 
     if queue_only:
         print(f"Queuing {len(stocks)} tickers for strategy {strategy}")
@@ -50,7 +63,12 @@ if __name__ == "__main__":
     cli = argparse.ArgumentParser()
     cli.add_argument("--simulate-only", action="store_true",
                      help="Skip enter_trades; just update DB for execution script")
+    
+    cli.add_argument("--analysis-only", action="store_true",
+                 help="Only print the selected tickers – no queuing, orders or monitoring")
+    
     args = cli.parse_args()
+
     # You can specify your strategy parameters here
     strategies = [
     # look at 40 best scores, open max 10 trades
@@ -74,9 +92,10 @@ if __name__ == "__main__":
         trade_count   = strat["trade_count"],
         lookback_days = strat["lookback_days"],
         min_positive  = strat["min_positive"],
-        open_new = not args.simulate_only,
-        do_monitor = not args.simulate_only,
-        queue_only = args.simulate_only,  
+        open_new   = not (args.simulate_only or args.analysis_only),
+        do_monitor = not (args.simulate_only or args.analysis_only),
+        queue_only =  args.simulate_only and not args.analysis_only,
+        analysis_only = args.analysis_only,  
     )
         print("Sleeping 1 minute to comply with API restrictions")
         #time.sleep(60) 
