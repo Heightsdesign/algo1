@@ -197,12 +197,11 @@ def minmax_volume(symbol: str, cash: float) -> float:
     # round to 2 decimals so both 1-share and 0.01-lot symbols are OK
     return round(vol, 2)
 
-
 def execute_strategy(
     strategy_id: int,
     *,
     leverage: float = 1.0,
-    even_bet: bool = True,
+    even_bet: bool = True,          # still here for compatibility
     override_capital: float | None = None,
 ) -> None:
     initialize_mt5()
@@ -225,28 +224,39 @@ def execute_strategy(
         tradable = []
 
         for row in raw_pending:
-            sym   = normalize_symbol(row["ticker"])
-            info  = mt5.symbol_info(sym)
+            sym = normalize_symbol(row["ticker"])
+
+            # ── ensure the symbol is available & visible ────────────────
+            info = mt5.symbol_info(sym)
+            if info is None or not info.visible:
+                 if not mt5.symbol_select(sym, True):          # returns False on failure
+                    log.warning("%s – cannot add to Market Watch, skipping", sym)
+                    continue
+                 
+
+            if info is None:
+                log.warning("%s – symbol not available, skipping", sym)
+                continue
+
             tick  = mt5.symbol_info_tick(sym)
             price = (tick.last or tick.bid or tick.ask) if tick else None
 
+            price_str = "N/A" if price is None else f"{price:.2f}"
             log.info(
                 "%s — p=%s  step=%g  min=%g  contract=%g",
-                sym,
-                "N/A" if not price else f"{price:.2f}",
-                info.volume_step,
-                info.volume_min,
+                sym, price_str, info.volume_step, info.volume_min,
                 info.trade_contract_size,
             )
 
+            # need a tradable price ------------------------------------------------
             if price is None or price <= 0:
                 log.warning("%s – no price, skipping", sym)
                 continue
 
-            # convert € budget to the symbol’s profit currency
+            # convert € budget to the symbol’s profit currency --------------------
             budget_qccy = budget_in_quote_ccy(est_pp, info)
 
-            # can the very minimum lot fit inside that converted budget?
+            # can the very minimum lot fit into that budget? ----------------------
             min_cost = price * info.volume_min * info.trade_contract_size
             if min_cost > budget_qccy:
                 log.warning(
@@ -278,14 +288,15 @@ def execute_strategy(
             tick = mt5.symbol_info_tick(sym)
             price = tick.last or tick.bid or tick.ask
 
-            # size: convert budget to quote-ccy, divide by contract value,
+            # size: convert € budget to quote-ccy, divide by contract value,
             # then round down to the allowed step
             budget_qccy = budget_in_quote_ccy(cash_pp, info)
             raw_vol     = budget_qccy / (price * info.trade_contract_size)
             qty         = round_down(raw_vol, info.volume_step)
 
             if qty < info.volume_min:
-                log.warning("%s – quantity rounds to 0 under budget %.2f €", sym, cash_pp)
+                log.warning("%s – quantity rounds to 0 under budget %.2f €",
+                            sym, cash_pp)
                 continue
 
             cost_qccy = qty * price * info.trade_contract_size
@@ -302,7 +313,7 @@ def execute_strategy(
             fill = res.price
             log.info("%s filled %.4g @ %.2f", sym, qty, fill)
             mark_filled(conn, row["id"], fill)
-            time.sleep(0.2)   # stay polite to the dealer
+            time.sleep(0.2)   # be nice to the dealer
 
     finally:
         conn.close()

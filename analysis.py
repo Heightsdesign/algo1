@@ -48,6 +48,7 @@ def run_analysis_and_trades(strategy,
 
     if queue_only:
         print(f"Queuing {len(stocks)} tickers for strategy {strategy}")
+        print(stocks)
         queue_trades(stocks, strategy)
 
     if open_new:

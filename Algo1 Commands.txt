@@ -1,0 +1,14 @@
+Algo1 Commands
+
+Main Analysis:
+
+python -m main
+
+Running Strategies: 
+
+python -m clear_trades
+python -m analysis --simulate-only
+
+Applying Strategies:
+
+python -m mt5_execution 1 --capital 1500 --leverage 1.0
