@@ -16,6 +16,7 @@ grpcio-status==1.71.0
 h11==0.14.0
 ib-insync==0.9.86
 idna==3.10
+MetaTrader5==5.0.5120
 multitasking==0.0.11
 nest-asyncio==1.6.0
 numpy==2.2.4
