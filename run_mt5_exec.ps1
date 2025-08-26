@@ -1,37 +1,29 @@
-# run_mt5_exec.ps1
-$ErrorActionPreference = "Stop"
+# --- run_mt5_exec.ps1 (hardened) ---
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $ScriptDir
 
-# Resolve project root (folder of this script)
-$BASE = Split-Path -Parent $MyInvocation.MyCommand.Path
-Set-Location $BASE
+# logs folder + file
+$logdir = Join-Path $ScriptDir "logs"
+New-Item -ItemType Directory -Force -Path $logdir | Out-Null
+$stamp  = Get-Date -Format "yyyyMMdd_HHmmss"
+$log    = Join-Path $logdir "mt5_exec_$stamp.log"
 
-# --- pick a Python interpreter (prefer venv -> .venv -> PATH) ---
-$candidates = @(
-  (Join-Path $BASE "venv\Scripts\python.exe"),
-  (Join-Path $BASE ".venv\Scripts\python.exe")
-)
-
-$PY = $null
-foreach ($p in $candidates) {
-  if (Test-Path $p) { $PY = $p; break }
+# pick the venv python (supports either 'venv' or '.venv')
+$PY = Join-Path $ScriptDir "venv\Scripts\python.exe"
+if (-not (Test-Path $PY)) {
+  $PY = Join-Path $ScriptDir ".venv\Scripts\python.exe"
 }
-if (-not $PY) {
-  $cmd = Get-Command python -ErrorAction SilentlyContinue
-  if ($cmd) { $PY = $cmd.Source } else {
-    $cmd = Get-Command py -ErrorAction SilentlyContinue
-    if ($cmd) { $PY = $cmd.Source } else {
-      throw "No Python found. Create venv with:  py -3 -m venv venv"
-    }
-  }
+"Using Python at: $PY" | Tee-Object -FilePath $log
+
+"=== start $(Get-Date) ===" | Tee-Object -FilePath $log -Append
+
+try {
+  & $PY -m mt5_execution 1 --capital 1500 --leverage 1.0 2>&1 |
+    Tee-Object -FilePath $log -Append
 }
-Write-Host "Using Python at: $PY"
-
-# --- logs ---
-$LOGDIR = Join-Path $BASE "logs"
-New-Item -ItemType Directory -Force -Path $LOGDIR | Out-Null
-$log = Join-Path $LOGDIR ("exec_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
-$env:PYTHONIOENCODING = "utf-8"
-
-"=== start $(Get-Date) ===" | Tee-Object -FilePath $log
-& $PY -m mt5_execution 1 --capital 1500 --leverage 1.0 2>&1 | Tee-Object -FilePath $log -Append
-"=== end $(Get-Date) ==="   | Tee-Object -FilePath $log -Append
+catch {
+  $_ | Out-String | Tee-Object -FilePath $log -Append
+}
+finally {
+  "=== end $(Get-Date) ===" | Tee-Object -FilePath $log -Append
+}

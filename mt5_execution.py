@@ -38,6 +38,7 @@ import MetaTrader5 as mt5
 from dotenv import load_dotenv
 import sqlite3
 from typing import List, TypedDict
+from zoneinfo import ZoneInfo
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s",
                     level=logging.INFO,
@@ -319,6 +320,122 @@ def execute_strategy(
         conn.close()
         shutdown_mt5()
 
+# ---------------------------------------------------------------------------
+# Close logic
+# ---------------------------------------------------------------------------
+
+def _now_in_tz() -> datetime:
+    load_dotenv()
+    tz = os.getenv("timezone", "Europe/Paris")
+    try:
+        return datetime.now(ZoneInfo(tz))
+    except Exception:
+        # Fallback: naive local time if zoneinfo missing; still works
+        return datetime.now()
+
+def is_eod_window() -> bool:
+    """
+    Basic EOD guard:
+    - Paris time 21:55–23:30 considered 'close window' (handles EU/US DST reasonably).
+    Adjust if you prefer a different window.
+    """
+    now = _now_in_tz().time()
+    return (now >= datetime.strptime("21:55","%H:%M").time() and
+            now <= datetime.strptime("23:30","%H:%M").time())
+
+def get_symbols_for_strategy(conn: sqlite3.Connection, strategy_id: int) -> list[str]:
+    """
+    Symbols to manage for this strategy. We use rows that are 'executed=1'
+    since those were actually sent to market (see mark_filled()).
+    """
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """SELECT DISTINCT ticker
+             FROM open_trades
+            WHERE strategy_id = ?
+              AND executed = 1""",
+        (strategy_id,),
+    ).fetchall()
+    return [normalize_symbol(r["ticker"]) for r in rows]
+
+def close_strategy_positions(strategy_id: int, *, force: bool = False, deviation: int = 10) -> None:
+    """
+    Close *all* MT5 positions that:
+      • belong to this strategy (detected via magic=99), and
+      • whose symbol appears in your DB for this strategy (executed=1).
+    By default, only acts during the EOD window. Use force=True to override.
+    """
+    initialize_mt5()
+    conn = get_conn()
+    try:
+        if (not force) and (not is_eod_window()):
+            log.info("Not in EOD window; skipping close (use force=True to override).")
+            return
+
+        # Build symbol allowlist from DB (so you don't accidentally touch other strategies)
+        permitted = set(get_symbols_for_strategy(conn, strategy_id))
+        if not permitted:
+            log.info("No executed trades found in DB for strategy %d.", strategy_id)
+            return
+
+        # Pull current positions
+        positions = mt5.positions_get()
+        if positions is None:
+            log.info("No positions in MT5.")
+            return
+
+        to_close = []
+        for pos in positions:
+            # Filter by our 'magic' tag and strategy symbols
+            if pos.magic != 99:
+                continue
+            if pos.symbol not in permitted:
+                continue
+            to_close.append(pos)
+
+        if not to_close:
+            log.info("No positions to close for strategy %d (magic=99, symbols match).", strategy_id)
+            return
+
+        log.info("Closing %d position(s) for strategy %d ...", len(to_close), strategy_id)
+
+        for pos in to_close:
+            # Determine opposite side to close
+            if pos.type == mt5.POSITION_TYPE_BUY:
+                close_type = mt5.ORDER_TYPE_SELL
+                side_str   = "SELL"
+            else:
+                close_type = mt5.ORDER_TYPE_BUY
+                side_str   = "BUY"
+
+            req = {
+                "action"      : mt5.TRADE_ACTION_DEAL,
+                "symbol"      : pos.symbol,
+                "volume"      : pos.volume,       # close full amount
+                "type"        : close_type,
+                "position"    : pos.ticket,       # close THIS position
+                "deviation"   : deviation,
+                "magic"       : 99,
+                "comment"     : "auto-close",
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+            res = mt5.order_send(req)
+            if res is None:
+                log.error("Close %s %.4g %s – failed: no result", side_str, pos.volume, pos.symbol)
+                continue
+
+            if res.retcode == mt5.TRADE_RETCODE_DONE:
+                log.info("Closed %s %.4g %s @ %.5f (ticket %s)",
+                         side_str, pos.volume, pos.symbol, res.price or 0.0, pos.ticket)
+            else:
+                log.error("Close %s %.4g %s – retcode=%s, details=%s",
+                          side_str, pos.volume, pos.symbol, res.retcode, res._asdict())
+
+    finally:
+        conn.close()
+        shutdown_mt5()
+
+
 
 # ---------------------------------------------------------------------------
 # CLI entry
@@ -330,11 +447,37 @@ if __name__ == "__main__":
     p.add_argument("--leverage", type=float, default=1.0)
     p.add_argument("--capital" , type=float, help="Override account equity")
     p.add_argument("--even-bet", action="store_true", default=True)
+
+    # NEW: close controls
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--close-only", action="store_true",
+                   help="Do not open anything; close positions for this strategy.")
+    g.add_argument("--open-only", action="store_true",
+                   help="Open only; skip closing (default behavior if neither specified).")
+
+    p.add_argument("--force-close", action="store_true",
+                   help="Ignore EOD window and close now.")
+    p.add_argument("--close-deviation", type=int, default=10,
+                   help="Max price deviation (points) for close orders.")
+
     args = p.parse_args()
 
-    execute_strategy(
-        args.strategy_id,
-        leverage=args.leverage,
-        even_bet=args.even_bet,
-        override_capital=args.capital,
-    )
+    if args.close_only:
+        close_strategy_positions(
+            args.strategy_id,
+            force=args.force_close,
+            deviation=args.close_deviation,
+        )
+    else:
+        # normal open path
+        execute_strategy(
+            args.strategy_id,
+            leverage=args.leverage,
+            even_bet=args.even_bet,
+            override_capital=args.capital,
+        )
+        # If you want automatic close after opening within EOD window, you can
+        # optionally follow with:
+        # if not args.open_only:
+        #     close_strategy_positions(args.strategy_id, force=args.force_close,
+        #                              deviation=args.close_deviation)
