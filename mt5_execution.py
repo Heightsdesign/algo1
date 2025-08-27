@@ -273,12 +273,14 @@ def execute_strategy(
             return
 
         # ------------------------------------------------------------------
-        # Phase 2 – final sizing & order placement
+        # Phase 2 – final sizing & order placement (NO REALLOCATION)
         # ------------------------------------------------------------------
-        trade_cnt = len(tradable)
-        cash_pp   = working_cap * leverage / trade_cnt
-        log.info("%d orders → %.2f € per position (leverage %.1f)",
-                 trade_cnt, cash_pp, leverage)
+        # Important: we keep the ORIGINAL per-position budget (est_pp),
+        # even if some symbols were skipped. Leftover cash is expected.
+        
+        cash_pp = est_pp
+        log.info("%d tradable symbols → using fixed %.2f € per position (no reallocation, leverage %.1f)",
+                 len(tradable), cash_pp, leverage)
 
         for row in tradable:
             sym  = normalize_symbol(row["ticker"])
@@ -296,13 +298,13 @@ def execute_strategy(
             qty         = round_down(raw_vol, info.volume_step)
 
             if qty < info.volume_min:
-                log.warning("%s – quantity rounds to 0 under budget %.2f €",
+                log.warning("%s – quantity rounds to 0 under fixed budget %.2f € (skipping)",
                             sym, cash_pp)
                 continue
 
             cost_qccy = qty * price * info.trade_contract_size
             log.info(
-                "%s %s %.4g (cost %.2f %s, budget %.2f €)",
+                "%s %s %.4g (cost %.2f %s, fixed budget %.2f €)",
                 act, sym, qty, cost_qccy, info.currency_profit, cash_pp
             )
 
@@ -360,47 +362,29 @@ def get_symbols_for_strategy(conn: sqlite3.Connection, strategy_id: int) -> list
 
 def close_strategy_positions(strategy_id: int, *, force: bool = False, deviation: int = 10) -> None:
     """
-    Close *all* MT5 positions that:
-      • belong to this strategy (detected via magic=99), and
-      • whose symbol appears in your DB for this strategy (executed=1).
-    By default, only acts during the EOD window. Use force=True to override.
+    Close all MT5 positions that were opened by this bot (magic=99).
+    This version ignores the DB allowlist (because executed column may not exist).
     """
     initialize_mt5()
-    conn = get_conn()
     try:
         if (not force) and (not is_eod_window()):
             log.info("Not in EOD window; skipping close (use force=True to override).")
             return
 
-        # Build symbol allowlist from DB (so you don't accidentally touch other strategies)
-        permitted = set(get_symbols_for_strategy(conn, strategy_id))
-        if not permitted:
-            log.info("No executed trades found in DB for strategy %d.", strategy_id)
-            return
-
-        # Pull current positions
         positions = mt5.positions_get()
-        if positions is None:
+        if not positions:
             log.info("No positions in MT5.")
             return
 
-        to_close = []
-        for pos in positions:
-            # Filter by our 'magic' tag and strategy symbols
-            if pos.magic != 99:
-                continue
-            if pos.symbol not in permitted:
-                continue
-            to_close.append(pos)
+        to_close = [p for p in positions if p.magic == 99]   # close everything we opened
 
         if not to_close:
-            log.info("No positions to close for strategy %d (magic=99, symbols match).", strategy_id)
+            log.info("No positions with magic=99 to close.")
             return
 
-        log.info("Closing %d position(s) for strategy %d ...", len(to_close), strategy_id)
+        log.info("Closing %d position(s) (magic=99) ...", len(to_close))
 
         for pos in to_close:
-            # Determine opposite side to close
             if pos.type == mt5.POSITION_TYPE_BUY:
                 close_type = mt5.ORDER_TYPE_SELL
                 side_str   = "SELL"
@@ -411,30 +395,23 @@ def close_strategy_positions(strategy_id: int, *, force: bool = False, deviation
             req = {
                 "action"      : mt5.TRADE_ACTION_DEAL,
                 "symbol"      : pos.symbol,
-                "volume"      : pos.volume,       # close full amount
+                "volume"      : pos.volume,
                 "type"        : close_type,
-                "position"    : pos.ticket,       # close THIS position
+                "position"    : pos.ticket,
                 "deviation"   : deviation,
                 "magic"       : 99,
                 "comment"     : "auto-close",
                 "type_filling": mt5.ORDER_FILLING_IOC,
             }
             res = mt5.order_send(req)
-            if res is None:
-                log.error("Close %s %.4g %s – failed: no result", side_str, pos.volume, pos.symbol)
-                continue
-
-            if res.retcode == mt5.TRADE_RETCODE_DONE:
+            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
                 log.info("Closed %s %.4g %s @ %.5f (ticket %s)",
                          side_str, pos.volume, pos.symbol, res.price or 0.0, pos.ticket)
             else:
-                log.error("Close %s %.4g %s – retcode=%s, details=%s",
-                          side_str, pos.volume, pos.symbol, res.retcode, res._asdict())
-
+                log.error("Close %s %.4g %s – failed: %s",
+                          side_str, pos.volume, pos.symbol, getattr(res, "retcode", "no result"))
     finally:
-        conn.close()
         shutdown_mt5()
-
 
 
 # ---------------------------------------------------------------------------
