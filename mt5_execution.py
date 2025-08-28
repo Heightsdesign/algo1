@@ -170,6 +170,26 @@ def round_down(vol: float, step: float) -> float:
     """Round *down* to the nearest allowed step (e.g. 0.01 or 1)."""
     return math.floor(vol / step) * step
 
+def _eurusd_bid():
+    t = mt5.symbol_info_tick("EURUSD")
+    return t.bid if t and t.bid > 0 else None
+
+def eur_to_profit(amount_eur: float, info: mt5.SymbolInfo, eurusd_bid: float | None) -> float:
+    if info.currency_profit == "EUR" or eurusd_bid is None:
+        return amount_eur
+    if info.currency_profit == "USD":
+        # € -> $ : divide by EURUSD
+        return amount_eur / eurusd_bid
+    return amount_eur  # fallback conservative
+
+def profit_to_eur(amount_profit: float, info: mt5.SymbolInfo, eurusd_bid: float | None) -> float:
+    if info.currency_profit == "EUR" or eurusd_bid is None:
+        return amount_profit
+    if info.currency_profit == "USD":
+        # $ -> € : multiply by EURUSD
+        return amount_profit * eurusd_bid
+    return amount_profit  # fallback conservative
+
 # ---------------------------------------------------------------------------
 # Core execution
 # ---------------------------------------------------------------------------
@@ -213,6 +233,15 @@ def execute_strategy(
         if not raw_pending:
             log.info("No trades to execute.")
             return
+
+        # ── De-duplicate by normalized symbol (one row per symbol) ─────────────
+        uniq_by_symbol = {}
+        for row in raw_pending:
+            sym = normalize_symbol(row["ticker"])
+            if sym not in uniq_by_symbol:
+                uniq_by_symbol[sym] = row   # keep the first occurrence
+        dedup_pending = list(uniq_by_symbol.values())
+        raw_pending = dedup_pending
 
         eq_account  = mt5.account_info().equity
         working_cap = override_capital or eq_account
@@ -271,145 +300,97 @@ def execute_strategy(
         if not tradable:
             log.info("Nothing fits into the %.2f € budget per position.", est_pp)
             return
-
-        # ------------------------------------------------------------------
-        # Phase 2 – final sizing & order placement (NO REALLOCATION)
-        # ------------------------------------------------------------------
-        # Important: we keep the ORIGINAL per-position budget (est_pp),
-        # even if some symbols were skipped. Leftover cash is expected.
         
-        cash_pp = est_pp
-        log.info("%d tradable symbols → using fixed %.2f € per position (no reallocation, leverage %.1f)",
-                 len(tradable), cash_pp, leverage)
+        # ------------------------------------------------------------------
+        # Phase 2 – plan volumes to maximize capital (single order per symbol)
+        # ------------------------------------------------------------------
+        total_eur = working_cap * leverage
+        cash_pp_eur = total_eur / len(tradable)
+        eurusd = _eurusd_bid()
 
+        # Gather symbol data once
+        syms = []
         for row in tradable:
             sym  = normalize_symbol(row["ticker"])
-            side = row["side"].upper()
-            act  = "BUY" if side == "LONG" else "SELL"
-
             info = mt5.symbol_info(sym)
             tick = mt5.symbol_info_tick(sym)
             price = tick.last or tick.bid or tick.ask
+            vmin, vstep, contract = info.volume_min, info.volume_step, info.trade_contract_size
 
-            # size: convert € budget to quote-ccy, divide by contract value,
-            # then round down to the allowed step
-            budget_qccy = budget_in_quote_ccy(cash_pp, info)
-            raw_vol     = budget_qccy / (price * info.trade_contract_size)
-            qty         = round_down(raw_vol, info.volume_step)
+            # initial volume from even split
+            budget_q = eur_to_profit(cash_pp_eur, info, eurusd)
+            raw_vol  = budget_q / (price * contract)
+            vol0     = max(vmin, round_down(raw_vol, vstep))
 
-            if qty < info.volume_min:
-                log.warning("%s – quantity rounds to 0 under fixed budget %.2f € (skipping)",
-                            sym, cash_pp)
+            # monetary stats
+            step_cost_q   = price * contract * vstep
+            step_cost_eur = profit_to_eur(step_cost_q, info, eurusd)
+            min_cost_q    = price * contract * vmin
+            min_cost_eur  = profit_to_eur(min_cost_q, info, eurusd)
+            cost0_q       = price * contract * vol0
+            cost0_eur     = profit_to_eur(cost0_q, info, eurusd)
+
+            syms.append({
+                "row": row, "sym": sym, "info": info, "price": price,
+                "vmin": vmin, "vstep": vstep, "contract": contract,
+                "vol": vol0, "cost_eur": cost0_eur,
+                "step_eur": max(step_cost_eur, 1e-9),  # avoid zero
+            })
+
+        # compute leftover and top-up greedily using the cheapest step first
+        spent_eur = sum(s["cost_eur"] for s in syms)
+        leftover = max(0.0, total_eur - spent_eur)
+
+        # If some symbols rounded down too much, we can add steps while budget allows
+        # Always respect volume_step; no max-volume constraint applied here.
+        if leftover > 0 and syms:
+            # Pre-sort by step cost; we’ll iterate in a cycle to distribute fairly
+            syms_sorted = sorted(syms, key=lambda x: x["step_eur"])
+            idx = 0
+            # hard cap iterations to avoid infinite loops due to tiny step costs
+            for _ in range(100000):
+                s = syms_sorted[idx]
+                step = s["vstep"]
+                if s["step_eur"] <= leftover + 1e-6:
+                    s["vol"] += step
+                    s["cost_eur"] += s["step_eur"]
+                    leftover -= s["step_eur"]
+                else:
+                    # if the cheapest step no longer fits, we’re done
+                    break
+                idx = (idx + 1) % len(syms_sorted)
+
+        # Final: place ONE order per symbol with the planned volume
+        log.info("%d tradable symbols → planned spend ≈ %.2f € of %.2f € (leverage %.1f)",
+                 len(syms), sum(s["cost_eur"] for s in syms), total_eur, leverage)
+
+        placed = set()
+        for s in syms:
+            sym = s["sym"]
+            if sym in placed:
+                continue
+            qty = s["vol"]
+            if qty < s["vmin"]:
+                log.warning("%s – planned qty %g < min %g (skip)", sym, qty, s["vmin"])
                 continue
 
-            cost_qccy = qty * price * info.trade_contract_size
-            log.info(
-                "%s %s %.4g (cost %.2f %s, fixed budget %.2f €)",
-                act, sym, qty, cost_qccy, info.currency_profit, cash_pp
-            )
+            side = s["row"]["side"].upper()
+            act  = "BUY" if side == "LONG" else "SELL"
+
+            est_cost = s["cost_eur"]
+            log.info("%s %s %.4g (planned cost ≈ %.2f €)", act, sym, qty, est_cost)
 
             res = order_market(sym, act, qty)
             if res is None or res.retcode != mt5.TRADE_RETCODE_DONE:
                 log.error("%s – order failed %s", sym, res)
                 continue
 
-            fill = res.price
-            log.info("%s filled %.4g @ %.2f", sym, qty, fill)
-            mark_filled(conn, row["id"], fill)
-            time.sleep(0.2)   # be nice to the dealer
+            fill = res.price or 0.0
+            log.info("%s filled %.4g @ %.5f", sym, qty, fill)
+            placed.add(sym)
+            mark_filled(conn, s["row"]["id"], fill)
+            time.sleep(0.2)
 
-    finally:
-        conn.close()
-        shutdown_mt5()
-
-# ---------------------------------------------------------------------------
-# Close logic
-# ---------------------------------------------------------------------------
-
-def _now_in_tz() -> datetime:
-    load_dotenv()
-    tz = os.getenv("timezone", "Europe/Paris")
-    try:
-        return datetime.now(ZoneInfo(tz))
-    except Exception:
-        # Fallback: naive local time if zoneinfo missing; still works
-        return datetime.now()
-
-def is_eod_window() -> bool:
-    """
-    Basic EOD guard:
-    - Paris time 21:55–23:30 considered 'close window' (handles EU/US DST reasonably).
-    Adjust if you prefer a different window.
-    """
-    now = _now_in_tz().time()
-    return (now >= datetime.strptime("21:55","%H:%M").time() and
-            now <= datetime.strptime("23:30","%H:%M").time())
-
-def get_symbols_for_strategy(conn: sqlite3.Connection, strategy_id: int) -> list[str]:
-    """
-    Symbols to manage for this strategy. We use rows that are 'executed=1'
-    since those were actually sent to market (see mark_filled()).
-    """
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        """SELECT DISTINCT ticker
-             FROM open_trades
-            WHERE strategy_id = ?
-              AND executed = 1""",
-        (strategy_id,),
-    ).fetchall()
-    return [normalize_symbol(r["ticker"]) for r in rows]
-
-def close_strategy_positions(strategy_id: int, *, force: bool = False, deviation: int = 10) -> None:
-    """
-    Close all MT5 positions that were opened by this bot (magic=99).
-    This version ignores the DB allowlist (because executed column may not exist).
-    """
-    initialize_mt5()
-    try:
-        if (not force) and (not is_eod_window()):
-            log.info("Not in EOD window; skipping close (use force=True to override).")
-            return
-
-        positions = mt5.positions_get()
-        if not positions:
-            log.info("No positions in MT5.")
-            return
-
-        to_close = [p for p in positions if p.magic == 99]   # close everything we opened
-
-        if not to_close:
-            log.info("No positions with magic=99 to close.")
-            return
-
-        log.info("Closing %d position(s) (magic=99) ...", len(to_close))
-
-        for pos in to_close:
-            if pos.type == mt5.POSITION_TYPE_BUY:
-                close_type = mt5.ORDER_TYPE_SELL
-                side_str   = "SELL"
-            else:
-                close_type = mt5.ORDER_TYPE_BUY
-                side_str   = "BUY"
-
-            req = {
-                "action"      : mt5.TRADE_ACTION_DEAL,
-                "symbol"      : pos.symbol,
-                "volume"      : pos.volume,
-                "type"        : close_type,
-                "position"    : pos.ticket,
-                "deviation"   : deviation,
-                "magic"       : 99,
-                "comment"     : "auto-close",
-                "type_filling": mt5.ORDER_FILLING_IOC,
-            }
-            res = mt5.order_send(req)
-            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-                log.info("Closed %s %.4g %s @ %.5f (ticket %s)",
-                         side_str, pos.volume, pos.symbol, res.price or 0.0, pos.ticket)
-            else:
-                log.error("Close %s %.4g %s – failed: %s",
-                          side_str, pos.volume, pos.symbol, getattr(res, "retcode", "no result"))
     finally:
         shutdown_mt5()
 
