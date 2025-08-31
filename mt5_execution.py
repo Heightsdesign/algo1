@@ -394,6 +394,98 @@ def execute_strategy(
     finally:
         shutdown_mt5()
 
+# ---------------------------------------------------------------------------
+# Close logic
+# ---------------------------------------------------------------------------
+
+def _now_in_tz() -> datetime:
+    load_dotenv()
+    tz = os.getenv("timezone", "Europe/Paris")
+    try:
+        return datetime.now(ZoneInfo(tz))
+    except Exception:
+        # Fallback: naive local time if zoneinfo missing; still works
+        return datetime.now()
+
+def is_eod_window() -> bool:
+    """
+    Basic EOD guard:
+    - Paris time 21:55–23:30 considered 'close window' (handles EU/US DST reasonably).
+    Adjust if you prefer a different window.
+    """
+    now = _now_in_tz().time()
+    return (now >= datetime.strptime("21:55","%H:%M").time() and
+            now <= datetime.strptime("23:30","%H:%M").time())
+
+def get_symbols_for_strategy(conn: sqlite3.Connection, strategy_id: int) -> list[str]:
+    """
+    Symbols to manage for this strategy. We use rows that are 'executed=1'
+    since those were actually sent to market (see mark_filled()).
+    """
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """SELECT DISTINCT ticker
+             FROM open_trades
+            WHERE strategy_id = ?
+              AND executed = 1""",
+        (strategy_id,),
+    ).fetchall()
+    return [normalize_symbol(r["ticker"]) for r in rows]
+
+def close_strategy_positions(strategy_id: int, *, force: bool = False, deviation: int = 10) -> None:
+    """
+    Close all MT5 positions that were opened by this bot (magic=99).
+    This version ignores the DB allowlist (because executed column may not exist).
+    """
+    initialize_mt5()
+    try:
+        if (not force) and (not is_eod_window()):
+            log.info("Not in EOD window; skipping close (use force=True to override).")
+            return
+
+        positions = mt5.positions_get()
+        if not positions:
+            log.info("No positions in MT5.")
+            return
+
+        to_close = [p for p in positions if p.magic == 99]   # close everything we opened
+
+        if not to_close:
+            log.info("No positions with magic=99 to close.")
+            return
+
+        log.info("Closing %d position(s) (magic=99) ...", len(to_close))
+
+        for pos in to_close:
+            if pos.type == mt5.POSITION_TYPE_BUY:
+                close_type = mt5.ORDER_TYPE_SELL
+                side_str   = "SELL"
+            else:
+                close_type = mt5.ORDER_TYPE_BUY
+                side_str   = "BUY"
+
+            req = {
+                "action"      : mt5.TRADE_ACTION_DEAL,
+                "symbol"      : pos.symbol,
+                "volume"      : pos.volume,
+                "type"        : close_type,
+                "position"    : pos.ticket,
+                "deviation"   : deviation,
+                "magic"       : 99,
+                "comment"     : "auto-close",
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+            res = mt5.order_send(req)
+            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                log.info("Closed %s %.4g %s @ %.5f (ticket %s)",
+                         side_str, pos.volume, pos.symbol, res.price or 0.0, pos.ticket)
+            else:
+                log.error("Close %s %.4g %s – failed: %s",
+                          side_str, pos.volume, pos.symbol, getattr(res, "retcode", "no result"))
+    finally:
+        shutdown_mt5()
+
+
 
 # ---------------------------------------------------------------------------
 # CLI entry
