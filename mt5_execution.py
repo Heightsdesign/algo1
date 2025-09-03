@@ -60,13 +60,16 @@ class TradeRow(TypedDict):
 def get_conn() -> sqlite3.Connection:
     return sqlite3.connect(DB_PATH)
 
-
 def fetch_pending(conn: sqlite3.Connection, strategy_id: int) -> List[TradeRow]:
     conn.row_factory = sqlite3.Row
+    today = _today_str()
     rows = conn.execute(
-        """SELECT id, ticker, COALESCE(shares,0) shares, COALESCE(side,'LONG') side
-               FROM open_trades WHERE strategy_id=? AND executed=0""",
-        (strategy_id,),
+        """SELECT id, ticker, COALESCE(shares,0) AS shares, COALESCE(side,'LONG') AS side
+             FROM open_trades
+            WHERE strategy_id = ?
+              AND date_opened = ?
+              AND executed = 0""",
+        (strategy_id, today),
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -190,6 +193,16 @@ def profit_to_eur(amount_profit: float, info: mt5.SymbolInfo, eurusd_bid: float 
         return amount_profit * eurusd_bid
     return amount_profit  # fallback conservative
 
+from zoneinfo import ZoneInfo  # if not already imported
+
+def _today_str() -> str:
+    tz = os.getenv("timezone", "Europe/Paris")
+    try:
+        now = datetime.now(ZoneInfo(tz))
+    except Exception:
+        now = datetime.now()
+    return now.strftime("%Y-%m-%d")
+
 # ---------------------------------------------------------------------------
 # Core execution
 # ---------------------------------------------------------------------------
@@ -233,6 +246,7 @@ def execute_strategy(
         if not raw_pending:
             log.info("No trades to execute.")
             return
+
 
         # ── De-duplicate by normalized symbol (one row per symbol) ─────────────
         uniq_by_symbol = {}

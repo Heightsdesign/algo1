@@ -3,7 +3,7 @@ from utils.utils import fetch_top_stocks, filter_stocks_by_performance
 import time
 import argparse
 
-def analyze_market_sentiment(filtered, top_n, lookback_days, min_positive=15):
+def analyze_market_sentiment(filtered, top_n, lookback_days, min_positive=10):
 
     ranked_stocks = [stock[0] for stock in fetch_top_stocks(top_n)]
 
@@ -77,7 +77,7 @@ if __name__ == "__main__":
      "lookback_days": 31, "min_positive": 15},
 
     # same pool but hold up to 15
-    {"id": 2, "use_filtered": True,  "top_n": 40, "trade_count": 15,
+    {"id": 2, "use_filtered": True,  "top_n": 40, "trade_count": 10,
      "lookback_days": 15, "min_positive": 15},
 
     # look at top 30 scores, hold up to 20 (no performance filter)
