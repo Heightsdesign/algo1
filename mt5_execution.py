@@ -61,17 +61,24 @@ def get_conn() -> sqlite3.Connection:
     return sqlite3.connect(DB_PATH)
 
 def fetch_pending(conn: sqlite3.Connection, strategy_id: int) -> List[TradeRow]:
+    """
+    Return rows for the most recent trading day present in open_trades for this strategy.
+    Avoids 'today' timezone mismatches and doesn't depend on a non-existent 'executed' column.
+    """
+    latest = get_latest_trade_date(conn, strategy_id)
+    if not latest:
+        return []
+
     conn.row_factory = sqlite3.Row
-    today = _today_str()
     rows = conn.execute(
         """SELECT id, ticker, COALESCE(shares,0) AS shares, COALESCE(side,'LONG') AS side
              FROM open_trades
             WHERE strategy_id = ?
-              AND date_opened = ?
-              AND executed = 0""",
-        (strategy_id, today),
+              AND date_opened = ?""",
+        (strategy_id, latest),
     ).fetchall()
     return [dict(r) for r in rows]
+
 
 
 def mark_filled(conn: sqlite3.Connection, row_id: int, fill: float):
@@ -203,6 +210,15 @@ def _today_str() -> str:
         now = datetime.now()
     return now.strftime("%Y-%m-%d")
 
+def get_latest_trade_date(conn: sqlite3.Connection, strategy_id: int) -> str | None:
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT MAX(date_opened) AS d FROM open_trades WHERE strategy_id = ?",
+        (strategy_id,)
+    ).fetchone()
+    return row["d"] if row and row["d"] else None
+
+
 # ---------------------------------------------------------------------------
 # Core execution
 # ---------------------------------------------------------------------------
@@ -246,6 +262,19 @@ def execute_strategy(
         if not raw_pending:
             log.info("No trades to execute.")
             return
+        
+        # One row per normalized symbol
+        uniq = {}
+        for row in raw_pending:
+            sym = normalize_symbol(row["ticker"])
+            if sym not in uniq:
+                uniq[sym] = row
+        raw_pending = list(uniq.values())
+
+        log.info("Using date=%s, %d tickers: %s",
+                get_latest_trade_date(conn, strategy_id),
+                len(raw_pending),
+                ", ".join(normalize_symbol(r["ticker"]) for r in raw_pending))
 
 
         # ── De-duplicate by normalized symbol (one row per symbol) ─────────────
