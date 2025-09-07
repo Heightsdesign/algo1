@@ -39,6 +39,8 @@ from dotenv import load_dotenv
 import sqlite3
 from typing import List, TypedDict
 from zoneinfo import ZoneInfo
+import numpy as np
+from indicators import connors_rsi_30m
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s",
                     level=logging.INFO,
@@ -217,6 +219,19 @@ def get_latest_trade_date(conn: sqlite3.Connection, strategy_id: int) -> str | N
         (strategy_id,)
     ).fetchone()
     return row["d"] if row and row["d"] else None
+
+def get_m30_closes(symbol: str, bars: int = 300) -> np.ndarray | None:
+    """Fetch last N closes for M30 timeframe from MT5."""
+    info = mt5.symbol_info(symbol)
+    if info is None or (info and not info.visible):
+        if not mt5.symbol_select(symbol, True):
+            log.warning("%s – cannot add to Market Watch.", symbol); return None
+
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M30, 0, bars)
+    if rates is None or len(rates) < 110:        # need >= 100 for PercentRank
+        log.warning("%s – not enough M30 bars (%s).", symbol, 0 if rates is None else len(rates)); return None
+    closes = np.array([r['close'] for r in rates], dtype=float)
+    return closes
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +541,143 @@ def close_strategy_positions(strategy_id: int, *, force: bool = False, deviation
                 log.error("Close %s %.4g %s – failed: %s",
                           side_str, pos.volume, pos.symbol, getattr(res, "retcode", "no result"))
     finally:
+        shutdown_mt5()
+
+def _in_session_paris(start="15:30", end="22:00") -> bool:
+    tz = ZoneInfo(os.getenv("timezone", "Europe/Paris"))
+    now = datetime.now(tz).time()
+    s_h, s_m = map(int, start.split(":"))
+    e_h, e_m = map(int, end.split(":"))
+    return (now >= datetime(s_h, s_m, 0).time()) and (now <= datetime(e_h, e_m, 0).time())
+
+def _today_paris_str() -> str:
+    tz = ZoneInfo(os.getenv("timezone", "Europe/Paris"))
+    return datetime.now(tz).strftime("%Y-%m-%d")
+
+def enqueue_signal_queue(conn, strategy_id: int, tickers: list[str]) -> None:
+    """Put today's tickers into signal_queue as PENDING (idempotent)."""
+    today = _today_paris_str()
+    cur = conn.cursor()
+    for t in tickers:
+        cur.execute("""
+            INSERT OR IGNORE INTO signal_queue (ticker, strategy_id, date_queued, status)
+            VALUES (?, ?, ?, 'PENDING')
+        """, (t, strategy_id, today))
+    conn.commit()
+
+def fetch_pending_queue(conn, strategy_id: int) -> list[dict]:
+    """Get today's PENDING queue for this strategy."""
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("""
+        SELECT id, ticker, status, last_crsi
+        FROM signal_queue
+        WHERE strategy_id = ? AND date_queued = ? AND status = 'PENDING'
+    """, (strategy_id, _today_paris_str())).fetchall()
+    return [dict(r) for r in rows]
+
+def mark_queue_entered(conn, q_id: int, crsi_val: float):
+    conn.execute("""UPDATE signal_queue SET status='ENTERED', last_crsi=?, last_checked=CURRENT_TIMESTAMP WHERE id=?""",
+                 (crsi_val, q_id))
+    conn.commit()
+
+def update_queue_crsi(conn, q_id: int, crsi_val: float):
+    conn.execute("""UPDATE signal_queue SET last_crsi=?, last_checked=CURRENT_TIMESTAMP WHERE id=?""",
+                 (crsi_val, q_id))
+    conn.commit()
+
+def monitor_crsi_and_execute(strategy_id: int,
+                             per_position_eur: float,
+                             *,
+                             threshold: float = 30.0,
+                             poll_seconds: int = 60,
+                             session_start="15:30",
+                             session_end="22:00") -> None:
+    """
+    Loop during the US session:
+    - for each queued symbol, compute CRSI on MT5 M30 bars
+    - if CRSI < threshold → send one market order sized to per_position_eur
+    """
+    initialize_mt5()
+    conn = get_conn()
+    try:
+        log.info("CRSI watcher start: strat=%d, budget/pos=%.2f€, thr=%.1f on M30", strategy_id, per_position_eur, threshold)
+
+        # derive EURUSD for budgeting once per loop
+        while True:
+            if not _in_session_paris(session_start, session_end):
+                time.sleep(poll_seconds)
+                continue
+
+            queue = fetch_pending_queue(conn, strategy_id)
+            if not queue:
+                time.sleep(poll_seconds)
+                continue
+
+            eurusd = mt5.symbol_info_tick("EURUSD")
+            eurusd_bid = eurusd.bid if eurusd and eurusd.bid > 0 else None
+
+            for row in queue:
+                sym = normalize_symbol(row["ticker"])
+                closes = get_m30_closes(sym, bars=300)
+                if closes is None:
+                    continue
+
+                crsi = connors_rsi_30m(closes)[-1]
+                update_queue_crsi(conn, row["id"], float(crsi))
+                log.info("%s M30 CRSI=%.2f", sym, crsi)
+
+                if crsi >= threshold:
+                    continue  # wait
+
+                # Size with your existing sizing rules (fixed € per pos, round to step)
+                info = mt5.symbol_info(sym)
+                tick = mt5.symbol_info_tick(sym)
+                if not info or not tick: 
+                    continue
+                price = tick.last or tick.bid or tick.ask
+                # convert EUR budget to symbol's profit currency
+                budget_qccy = budget_in_quote_ccy(per_position_eur, info)
+                raw_vol = budget_qccy / (price * info.trade_contract_size)
+                qty = round_down(raw_vol, info.volume_step)
+                if qty < info.volume_min:
+                    log.warning("%s – qty rounds to < min; skip", sym)
+                    continue
+
+                side = "BUY"  # your strategy is long-only today; adapt if needed
+                res = order_market(sym, side, qty)
+                if res is None or res.retcode != mt5.TRADE_RETCODE_DONE:
+                    log.error("%s – order failed %s", sym, res)
+                    continue
+
+                fill = res.price or price
+                log.info("ENTER %s %.4g @ %.5f (CRSI %.2f)", sym, qty, fill, crsi)
+
+                # write to open_trades (compute SL/TP exactly like you do now)
+                c = conn.cursor()
+                # Read price targets (already in your DB via main.py)
+                pt = c.execute("SELECT average_price FROM price_targets WHERE ticker = ?", (row["ticker"],)).fetchone()
+                if not pt:  # fallback SL/TP (e.g., 1R) if no price target is present
+                    sl = round(fill * 0.95, 2)
+                    tp = round(fill * 1.05, 2)
+                else:
+                    avg = float(pt[0])
+                    tgt_pct = (avg - fill) / fill
+                    sl = round(fill * (1 - tgt_pct), 2)
+                    tp = round(fill * (1 + tgt_pct), 2)
+
+                date_opened = _today_paris_str()
+                c.execute("""
+                    INSERT INTO open_trades (ticker, entry_price, stop_loss, target_price, date_opened, strategy_id)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (row["ticker"], float(fill), float(sl), float(tp), date_opened, strategy_id))
+                conn.commit()
+
+                mark_queue_entered(conn, row["id"], float(crsi))
+                time.sleep(0.2)
+
+            time.sleep(poll_seconds)
+    finally:
+        conn.close()
         shutdown_mt5()
 
 
