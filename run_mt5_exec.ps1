@@ -1,4 +1,11 @@
-# --- run_mt5_exec.ps1 (hardened) ---
+# --- run_mt5_exec.ps1 (updated for CRSI watcher) ---
+param(
+    [int]    $StrategyId    = 2,
+    [double] $PerPosEUR     = 40,
+    [double] $Threshold     = 30,
+    [int]    $PollSeconds   = 600
+)
+
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ScriptDir
 
@@ -18,7 +25,11 @@ if (-not (Test-Path $PY)) {
 "=== start $(Get-Date) ===" | Tee-Object -FilePath $log -Append
 
 try {
-  & $PY -m mt5_execution 1 --capital 1500 --leverage 1.0 2>&1 |
+  & $PY -m mt5_execution $StrategyId `
+        --watch-crsi `
+        --per-pos-eur $PerPosEUR `
+        --crsi-threshold $Threshold `
+        --poll $PollSeconds 2>&1 |
     Tee-Object -FilePath $log -Append
 }
 catch {

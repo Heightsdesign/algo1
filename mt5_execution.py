@@ -30,7 +30,7 @@ The script will:
 from __future__ import annotations
 
 import os, sys, time, math, logging, argparse
-from datetime import datetime, timezone, time
+from datetime import datetime, timezone, time as dt_time
 from decimal import Decimal, ROUND_FLOOR
 from typing import List
 
@@ -554,8 +554,8 @@ def _in_session_paris(start="15:30", end="22:00") -> bool:
     s_h, s_m = map(int, start.split(":"))
     e_h, e_m = map(int, end.split(":"))
 
-    start_t = time(hour=s_h, minute=s_m)
-    end_t   = time(hour=e_h, minute=e_m)
+    start_t = dt_time(hour=s_h, minute=s_m)
+    end_t   = dt_time(hour=e_h, minute=e_m)
 
     if start_t <= end_t:
         # normal same-day window
