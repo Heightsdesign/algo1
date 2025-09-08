@@ -681,29 +681,43 @@ def monitor_crsi_and_execute(strategy_id: int,
         shutdown_mt5()
 
 
-
 # ---------------------------------------------------------------------------
 # CLI entry
 # ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("strategy_id", type=int)
+
+    # sizing/common
     p.add_argument("--leverage", type=float, default=1.0)
     p.add_argument("--capital" , type=float, help="Override account equity")
     p.add_argument("--even-bet", action="store_true", default=True)
 
-    # NEW: close controls
-    g = p.add_mutually_exclusive_group()
-    g.add_argument("--close-only", action="store_true",
-                   help="Do not open anything; close positions for this strategy.")
-    g.add_argument("--open-only", action="store_true",
-                   help="Open only; skip closing (default behavior if neither specified).")
+    # ===== execution modes =====
+    modes = p.add_mutually_exclusive_group()
+    modes.add_argument("--close-only", action="store_true",
+                       help="Do not open anything; close positions for this strategy.")
+    modes.add_argument("--watch-crsi", action="store_true",
+                       help="Run the CRSI watcher on M30 and enter when CRSI<threshold.")
+    # (implicit default if none selected: open-now via execute_strategy)
 
+    # ===== close params =====
     p.add_argument("--force-close", action="store_true",
                    help="Ignore EOD window and close now.")
     p.add_argument("--close-deviation", type=int, default=10,
                    help="Max price deviation (points) for close orders.")
+
+    # ===== CRSI watcher params =====
+    p.add_argument("--per-pos-eur", type=float, default=40.0,
+                   help="Budget in EUR per position for CRSI entries.")
+    p.add_argument("--crsi-threshold", type=float, default=30.0,
+                   help="Enter when Connors RSI (M30) falls below this value.")
+    p.add_argument("--poll", type=int, default=60,
+                   help="Polling interval in seconds for the CRSI watcher.")
+    p.add_argument("--session-start", default="15:30",
+                   help="Paris time HH:MM when watcher starts acting.")
+    p.add_argument("--session-end", default="22:00",
+                   help="Paris time HH:MM when watcher stops acting.")
 
     args = p.parse_args()
 
@@ -713,16 +727,23 @@ if __name__ == "__main__":
             force=args.force_close,
             deviation=args.close_deviation,
         )
+
+    elif args.watch_crsi:
+        # CRSI intraday entry loop (one order per symbol when CRSI<threshold)
+        monitor_crsi_and_execute(
+            args.strategy_id,
+            per_position_eur=args.per_pos_eur,
+            threshold=args.crsi_threshold,
+            poll_seconds=args.poll,
+            session_start=args.session_start,
+            session_end=args.session_end,
+        )
+
     else:
-        # normal open path
+        # Open-now path (legacy / immediate open)
         execute_strategy(
             args.strategy_id,
             leverage=args.leverage,
             even_bet=args.even_bet,
             override_capital=args.capital,
         )
-        # If you want automatic close after opening within EOD window, you can
-        # optionally follow with:
-        # if not args.open_only:
-        #     close_strategy_positions(args.strategy_id, force=args.force_close,
-        #                              deviation=args.close_deviation)

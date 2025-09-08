@@ -80,7 +80,8 @@ def initialize_database():
         UNIQUE(ticker, year_month)
     );
     """)
-
+        
+    # ── Open Trades ───────────────────────────────────────────────────────────
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS open_trades (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -88,20 +89,19 @@ def initialize_database():
         entry_price     REAL    NOT NULL,
         stop_loss       REAL    NOT NULL,
         target_price    REAL    NOT NULL,
-        shares          INTEGER,            -- NEW: optional fixed-share sizing
-        trailing_stop   REAL,               -- ATR trail
-        executed        INTEGER DEFAULT 0,  -- 0 = not sent to IB, 1 = filled
+        shares          INTEGER,            -- optional fixed-share sizing
+        trailing_stop   REAL,               -- ATR trail (optional)
+        executed        INTEGER DEFAULT 0,  -- 0 = not sent / not filled, 1 = filled
         execution_price REAL,
         execution_time  TEXT,
         date_opened     TEXT    NOT NULL,
         strategy_id     INTEGER,
         side            TEXT DEFAULT 'LONG',
-        executed        INTEGER DEFAULT 0,
         FOREIGN KEY(strategy_id) REFERENCES strategies(id)
     );
     """)
 
-    # ── Closed Trades (archive) ─────────────────────────────────────────────
+    # ── Closed Trades (archive) ───────────────────────────────────────────────
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS closed_trades (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -119,7 +119,7 @@ def initialize_database():
     );
     """)
 
-    # Table for PnL history, now with strategy_id
+    # ── PnL history ───────────────────────────────────────────────────────────
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS pnl_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -133,20 +133,26 @@ def initialize_database():
     );
     """)
 
-        # ── Signal Queue (watchlist for intraday entry signals like Connors RSI) ─────
+    # ── Signal Queue (watchlist for Connors RSI triggers) ─────────────────────
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS signal_queue (
         id           INTEGER PRIMARY KEY AUTOINCREMENT,
         ticker       TEXT        NOT NULL,
         strategy_id  INTEGER     NOT NULL,
-        date_queued  TEXT        NOT NULL,         -- 'YYYY-MM-DD' in your local TZ (e.g., Europe/Paris)
+        date_queued  TEXT        NOT NULL,         -- 'YYYY-MM-DD' Europe/Paris
         status       TEXT        NOT NULL DEFAULT 'PENDING',  -- PENDING | ENTERED | CANCELLED
-        last_crsi    REAL,                          -- optional: for visibility/logging
-        last_checked TEXT,                          -- optional: timestamp of last indicator check
+        last_crsi    REAL,                          -- optional: latest computed CRSI
+        last_checked TEXT,                          -- optional: last indicator check timestamp
         FOREIGN KEY(strategy_id) REFERENCES strategies(id),
-        UNIQUE(ticker, strategy_id, date_queued)     -- one row per (ticker, strategy, day)
+        UNIQUE(ticker, strategy_id, date_queued)
     );
     """)
+
+    cursor.execute("""
+    CREATE INDEX IF NOT EXISTS ix_signal_queue_status
+    ON signal_queue (strategy_id, date_queued, status);
+    """)
+
 
     # Helpful indexes for fast lookups during the session
     cursor.execute("""
