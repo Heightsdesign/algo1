@@ -623,6 +623,10 @@ def monitor_crsi_and_execute(strategy_id: int,
                 continue
 
             queue = fetch_pending_queue(conn, strategy_id)
+
+            log.info("Queue today (strategy %d): %s",
+            strategy_id, ", ".join(q["ticker"] for q in queue) or "—")
+
             if not queue:
                 time.sleep(poll_seconds)
                 continue
@@ -631,17 +635,50 @@ def monitor_crsi_and_execute(strategy_id: int,
             eurusd_bid = eurusd.bid if eurusd and eurusd.bid > 0 else None
 
             for row in queue:
-                sym = normalize_symbol(row["ticker"])
-                closes = get_m30_closes(sym, bars=300)
-                if closes is None:
+                # --- Resolve symbol ---
+                sym = resolve_mt5_symbol(conn, row["ticker"]) if 'resolve_mt5_symbol' in globals() else normalize_symbol(row["ticker"])
+                if not sym:
+                    log.warning("%s – cannot resolve MT5 symbol; cancelling from queue.", row["ticker"])
+                    conn.execute("""
+                        UPDATE signal_queue
+                        SET status='CANCELLED',
+                            last_checked=CURRENT_TIMESTAMP
+                        WHERE id=?
+                    """, (row["id"],))
+                    conn.commit()
                     continue
 
+                # --- Ensure visibility ---
+                if not (mt5.symbol_info(sym) and mt5.symbol_info(sym).visible):
+                    if not mt5.symbol_select(sym, True):
+                        log.warning("%s – symbol_select failed; skipping this pass.", sym)
+                        continue
+
+                # --- Get 30m closes ---
+                closes = get_m30_closes(sym, bars=300)
+                if closes is None:
+                    log.warning("%s – skipping: not enough M30 bars / data unavailable.", sym)
+                    continue
+
+                info = mt5.symbol_info(sym)
+                tick = mt5.symbol_info_tick(sym)
+                if not info or not tick:
+                    log.warning("%s – skipping: no symbol info or tick.", sym)
+                    continue
+
+                price = tick.last or tick.bid or tick.ask
+                if not price:
+                    log.warning("%s – skipping: no price.", sym)
+                    continue
+
+                # --- Compute CRSI ---
                 crsi = connors_rsi_30m(closes)[-1]
                 update_queue_crsi(conn, row["id"], float(crsi))
                 log.info("%s M30 CRSI=%.2f", sym, crsi)
 
+                # --- Threshold check ---
                 if crsi >= threshold:
-                    continue  # wait
+                    continue
 
                 # Size with your existing sizing rules (fixed € per pos, round to step)
                 info = mt5.symbol_info(sym)

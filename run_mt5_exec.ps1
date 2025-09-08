@@ -3,7 +3,7 @@ param(
     [int]    $StrategyId    = 2,
     [double] $PerPosEUR     = 40,
     [double] $Threshold     = 30,
-    [int]    $PollSeconds   = 600
+    [int]    $PollSeconds   = 60
 )
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
