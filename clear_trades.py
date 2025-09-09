@@ -14,7 +14,7 @@ def list_tables(db_path="algo1.db"):
 def clear_trade_tables(db_path="algo1.db"):
     connection = sqlite3.connect(db_path)
     cursor = connection.cursor()
-    tables = ["strategies","open_trades", "closed_trades", "pnl_history"]
+    tables = ["strategies", "open_trades", "closed_trades", "pnl_history", "signal_queue"]
     for table in tables:
         cursor.execute(f"DELETE FROM {table};")
         print(f"Cleared table: {table}")
@@ -25,3 +25,4 @@ def clear_trade_tables(db_path="algo1.db"):
 if __name__ == "__main__":
     list_tables()
     clear_trade_tables()
+
