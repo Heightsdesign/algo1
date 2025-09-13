@@ -1,40 +1,111 @@
-# --- run_mt5_exec.ps1 (updated for CRSI watcher) ---
+# --- run_mt5_exec.ps1 (drop-in replacement) ---
 param(
-    [int]    $StrategyId    = 2,
-    [double] $PerPosEUR     = 40,
-    [double] $Threshold     = 30,
-    [int]    $PollSeconds   = 60
+    # Strategy + sizing
+    [int]    $StrategyId   = 2,
+    [double] $PerPosEUR    = 40,      # for CRSI watcher
+    [double] $Threshold    = 30,      # Connors RSI threshold
+    [int]    $PollSeconds  = 60,      # CRSI poll interval (seconds)
+
+    # Legacy open-now sizing (only used in -Mode OpenNow)
+    [double] $Capital      = 3000,
+    [double] $Leverage     = 1.0,
+
+    # Close params (only used in -Mode CloseOnly)
+    [int]    $CloseDeviation = 10,
+    [switch] $ForceClose,
+
+    # Mode: WatchCrsi | OpenNow | CloseOnly
+    [ValidateSet("WatchCrsi","OpenNow","CloseOnly")]
+    [string] $Mode = "WatchCrsi"
 )
 
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-Set-Location $ScriptDir
+# --- Make logs readable (force UTF-8) ---
+$OutputEncoding = [System.Text.Encoding]::UTF8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUNBUFFERED  = "1"
 
-# logs folder + file
-$logdir = Join-Path $ScriptDir "logs"
-New-Item -ItemType Directory -Force -Path $logdir | Out-Null
-$stamp  = Get-Date -Format "yyyyMMdd_HHmmss"
-$log    = Join-Path $logdir "mt5_exec_$stamp.log"
+# --- Work in repo root ---
+$ROOT = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $ROOT
 
-# pick the venv python (supports either 'venv' or '.venv')
-$PY = Join-Path $ScriptDir "venv\Scripts\python.exe"
-if (-not (Test-Path $PY)) {
-  $PY = Join-Path $ScriptDir ".venv\Scripts\python.exe"
+# --- Logs ---
+$logDir = Join-Path $ROOT "logs"
+New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+$stamp  = Get-Date -Format "yyyyMMdd-HHmmss"
+$log    = Join-Path $logDir ("mt5_" + $Mode.ToLower() + "_$stamp.log")
+
+# Optional: transcript captures *everything* PowerShell sees
+$transcript = Join-Path $logDir ("transcript_" + $Mode.ToLower() + "_$stamp.txt")
+Start-Transcript -Path $transcript -Encoding UTF8 | Out-Null
+
+function Write-Log($text) {
+    $text | Tee-Object -FilePath $log -Append | Out-Null
 }
-"Using Python at: $PY" | Tee-Object -FilePath $log
 
-"=== start $(Get-Date) ===" | Tee-Object -FilePath $log -Append
+Write-Log "=== start $(Get-Date) ==="
+Write-Log "PWD: $PWD"
+Write-Log "ROOT: $ROOT"
+Write-Log "Mode: $Mode  Strategy=$StrategyId  PerPosEUR=$PerPosEUR  Threshold=$Threshold  Poll=$PollSeconds  Capital=$Capital  Leverage=$Leverage  ForceClose=$ForceClose"
 
+# --- Resolve python.exe (prefer venv) ---
+$candidates = @(
+    (Join-Path $ROOT 'venv\Scripts\python.exe'),
+    (Join-Path $ROOT '.venv\Scripts\python.exe'),
+    (Get-Command python -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source),
+    (Get-Command py     -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source)
+) | Where-Object { $_ -and (Test-Path $_) -and -not (Get-Item $_).PSIsContainer }
+
+$PY = $candidates | Select-Object -First 1
+if (-not $PY) {
+    Write-Log "ERROR: Could not find python.exe"
+    Write-Log "Checked: $($candidates -join '; ')"
+    Write-Log "=== end $(Get-Date) ==="
+    Stop-Transcript | Out-Null
+    exit 1
+}
+Write-Log "Using Python at: $PY"
+
+# --- Build Python args by mode ---
+$pyArgs = @()
+
+switch ($Mode) {
+    "WatchCrsi" {
+        $pyArgs = @('-m','mt5_execution', "$StrategyId",
+                    '--watch-crsi',
+                    '--per-pos-eur',  ([string]$PerPosEUR),
+                    '--crsi-threshold', ([string]$Threshold),
+                    '--poll', ([string]$PollSeconds))
+    }
+    "OpenNow" {
+        # legacy immediate-open path
+        $ci     = [System.Globalization.CultureInfo]::InvariantCulture
+        $capStr = [string]::Format($ci, "{0}", $Capital)
+        $levStr = [string]::Format($ci, "{0}", $Leverage)
+        $pyArgs = @('-m','mt5_execution', "$StrategyId",
+                    '--capital', $capStr,
+                    '--leverage', $levStr)
+    }
+    "CloseOnly" {
+        $pyArgs = @('-m','mt5_execution', "$StrategyId",
+                    '--close-only',
+                    '--close-deviation', ([string]$CloseDeviation))
+        if ($ForceClose) { $pyArgs += '--force-close' }
+    }
+}
+
+# --- Run python and mirror output to log ---
 try {
-  & $PY -m mt5_execution $StrategyId `
-        --watch-crsi `
-        --per-pos-eur $PerPosEUR `
-        --crsi-threshold $Threshold `
-        --poll $PollSeconds 2>&1 |
-    Tee-Object -FilePath $log -Append
+    & "$PY" @pyArgs 2>&1 | Tee-Object -FilePath $log -Append
+    $code = $LASTEXITCODE
+    Write-Log "ExitCode: $code"
 }
 catch {
-  $_ | Out-String | Tee-Object -FilePath $log -Append
+    $_ | Out-String | Tee-Object -FilePath $log -Append
+    $code = 1
 }
 finally {
-  "=== end $(Get-Date) ===" | Tee-Object -FilePath $log -Append
+    Write-Log "=== end $(Get-Date) ==="
+    Stop-Transcript | Out-Null
+    exit $code
 }

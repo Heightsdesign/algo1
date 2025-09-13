@@ -565,28 +565,56 @@ def _in_session_paris(start="15:30", end="22:00") -> bool:
         return now_t >= start_t or now_t <= end_t
     
 def _today_paris_str() -> str:
+    from zoneinfo import ZoneInfo
+    from datetime import datetime
     tz = ZoneInfo(os.getenv("timezone", "Europe/Paris"))
     return datetime.now(tz).strftime("%Y-%m-%d")
 
 def enqueue_signal_queue(conn, strategy_id: int, tickers: list[str]) -> None:
-    """Put today's tickers into signal_queue as PENDING (idempotent)."""
     today = _today_paris_str()
     cur = conn.cursor()
     for t in tickers:
         cur.execute("""
-            INSERT OR IGNORE INTO signal_queue (ticker, strategy_id, date_queued, status)
-            VALUES (?, ?, ?, 'PENDING')
+            INSERT INTO signal_queue (ticker, strategy_id, date_queued, status, last_crsi, last_checked)
+            VALUES (?, ?, ?, 'PENDING', NULL, NULL)
+            ON CONFLICT(ticker, strategy_id, date_queued) DO UPDATE SET
+                status='PENDING', last_crsi=NULL, last_checked=NULL
         """, (t, strategy_id, today))
     conn.commit()
 
-def fetch_pending_queue(conn, strategy_id: int) -> list[dict]:
-    """Get today's PENDING queue for this strategy."""
+
+def _get_latest_queue_date(conn, strategy_id: int) -> str | None:
     conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT MAX(date_queued) AS d FROM signal_queue WHERE strategy_id = ?",
+        (strategy_id,)
+    ).fetchone()
+    return row["d"] if row and row["d"] else None
+
+def fetch_pending_queue(conn, strategy_id: int) -> list[dict]:
+    """Prefer today's PENDING queue; if empty, fall back to the latest queue date."""
+    conn.row_factory = sqlite3.Row
+    today = _today_paris_str()
     rows = conn.execute("""
         SELECT id, ticker, status, last_crsi
-        FROM signal_queue
-        WHERE strategy_id = ? AND date_queued = ? AND status = 'PENDING'
-    """, (strategy_id, _today_paris_str())).fetchall()
+          FROM signal_queue
+         WHERE strategy_id = ? AND date_queued = ? AND status = 'PENDING'
+    """, (strategy_id, today)).fetchall()
+
+    if rows:
+        return [dict(r) for r in rows]
+
+    # fallback — use the last available date for this strategy
+    latest = _get_latest_queue_date(conn, strategy_id)
+    if not latest or latest == today:
+        return [dict(r) for r in rows]  # stay empty if none
+    rows = conn.execute("""
+        SELECT id, ticker, status, last_crsi
+          FROM signal_queue
+         WHERE strategy_id = ? AND date_queued = ? AND status = 'PENDING'
+    """, (strategy_id, latest)).fetchall()
+    if rows:
+        log.warning("No queue for today; falling back to latest date %s.", latest)
     return [dict(r) for r in rows]
 
 def mark_queue_entered(conn, q_id: int, crsi_val: float):
