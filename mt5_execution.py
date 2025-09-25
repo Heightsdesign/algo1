@@ -233,6 +233,160 @@ def get_m30_closes(symbol: str, bars: int = 300) -> np.ndarray | None:
     closes = np.array([r['close'] for r in rates], dtype=float)
     return closes
 
+# ── M30 data, pivots, ATR, volume ────────────────────────────────────────────
+def get_m30_rates(symbol: str, bars: int = 600):
+    info = mt5.symbol_info(symbol)
+    if info is None or not info.visible:
+        if not mt5.symbol_select(symbol, True):
+            log.warning("%s – cannot add to Market Watch.", symbol)
+            return None
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M30, 0, bars)
+    # convert numpy to list of dicts with keys like 'time','open','high','low','close','tick_volume'
+    return rates if (rates is not None and len(rates) >= 60) else None
+
+def _pivot_levels_from_rates(rates, left: int = 3, right: int = 3):
+    highs = [r['high'] for r in rates]
+    lows  = [r['low']  for r in rates]
+    n = len(rates)
+    if n < left + right + 3:
+        return None, None
+    res_levels, sup_levels = [], []
+    for i in range(left, n - right):
+        hi = highs[i]; lo = lows[i]
+        if all(hi >= highs[i-j] for j in range(1, left+1)) and all(hi >= highs[i+j] for j in range(1, right+1)):
+            res_levels.append(hi)
+        if all(lo <= lows[i-j] for j in range(1, left+1)) and all(lo <= lows[i+j] for j in range(1, right+1)):
+            sup_levels.append(lo)
+    return (res_levels[-1] if res_levels else None,
+            sup_levels[-1] if sup_levels else None)
+
+def _atr14_from_rates(rates):
+    import math
+    highs = [r['high'] for r in rates]
+    lows  = [r['low']  for r in rates]
+    closes= [r['close'] for r in rates]
+    trs = []
+    for i in range(1, len(rates)):
+        tr = max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+        trs.append(tr)
+    if len(trs) < 14:
+        return None
+    # simple moving average of last 14 TRs
+    return sum(trs[-14:]) / 14.0
+
+def _sl_tp_from_support(entry: float, support: float, rr: float = 2.0):
+    sl = round(support, 2)
+    risk = max(1e-6, entry - sl)
+    tp  = round(entry + rr * risk, 2)
+    return sl, tp
+
+def _has_open_position(symbol: str, magic: int = 99) -> bool:
+    poss = mt5.positions_get(symbol=symbol)
+    if not poss: return False
+    return any(p.magic == magic for p in poss)
+
+def _median(seq):
+    s = sorted(seq)
+    n = len(s)
+    if n == 0: return None
+    mid = n // 2
+    return (s[mid] if n % 2 else (s[mid-1]+s[mid]) / 2)
+
+def _vol_spike_ok(rates, mult: float = 1.5, lookback: int = 40, confirm_close: bool = True):
+    """
+    Volume filter: last closed bar tick_volume >= mult * median(tick_volume of prior N bars)
+    If confirm_close=False, uses current forming bar; else uses previous (closed) bar.
+    """
+    if len(rates) < lookback + 5: return False
+    tv = [r['tick_volume'] for r in rates]
+    if confirm_close:
+        cur_vol = tv[-2]   # last CLOSED bar
+        base = tv[-(lookback+2):-2]
+    else:
+        cur_vol = tv[-1]   # current forming bar
+        base = tv[-(lookback+1):-1]
+    med = _median(base)
+    if med is None or med <= 0: return False
+    return cur_vol >= mult * med
+
+def _atr_buffer_pct(rates, min_buffer_pct: float = 0.10, atr_mult: float = 0.20):
+    """
+    Buffer as max(min_buffer_pct, atr_mult * ATR% of last close).
+    Returns percentage (e.g., 0.12 = 0.12%)
+    """
+    atr = _atr14_from_rates(rates)
+    if not atr: return min_buffer_pct
+    last_close = rates[-2]['close'] if len(rates) >= 2 else rates[-1]['close']
+    atr_pct = (atr / max(1e-9, last_close)) * 100.0
+    return max(min_buffer_pct, atr_pct * atr_mult)
+
+def _get_position(symbol: str, magic: int = 99):
+    poss = mt5.positions_get(symbol=symbol)
+    if not poss:
+        return None
+    # Prefer our own positions (magic=99)
+    for p in poss:
+        if getattr(p, "magic", None) == magic:
+            return p
+    # fallback: any position on the symbol
+    return poss[0]
+
+def _modify_sltp(symbol: str, sl: float | None, tp: float | None):
+    req = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "symbol": symbol,
+        "sl": sl if sl is not None else 0.0,
+        "tp": tp if tp is not None else 0.0,
+    }
+    return mt5.order_send(req)
+
+
+def maybe_trail_position(conn, ticker: str, symbol: str, *, rr_trigger: float = 2.0, lock_rr: float = 0.5, magic: int = 99):
+    """
+    If current R >= rr_trigger, move SL to entry + lock_rr * R_size.
+    R_size = entry - initial_SL (from DB).
+    Never decreases SL.
+    """
+    # 1) fetch DB initial entry & SL (entry is the execution_price; initial SL is open_trades.stop_loss)
+    c = conn.cursor()
+    c.execute("""
+        SELECT execution_price, stop_loss
+        FROM open_trades
+        WHERE ticker = ? AND executed=1
+        ORDER BY id DESC LIMIT 1
+    """, (ticker,))
+    row = c.fetchone()
+    if not row:
+        return
+    entry, initial_sl = float(row[0]), float(row[1])
+    r_size = max(1e-9, entry - initial_sl)  # initial risk
+
+    # 2) get live price and current SL from MT5
+    pos = _get_position(symbol, magic=magic)
+    if not pos:
+        return
+    tick = mt5.symbol_info_tick(symbol)
+    price = (tick.last or tick.bid or tick.ask) if tick else None
+    if not price:
+        return
+
+    # 3) compute current R
+    current_r = (price - entry) / r_size
+
+    if current_r >= rr_trigger:
+        target_sl = entry + lock_rr * r_size
+        # never loosen SL
+        current_sl = float(getattr(pos, "sl", 0.0) or 0.0)
+        if current_sl < target_sl:
+            res = _modify_sltp(symbol, sl=round(target_sl, 2), tp=getattr(pos, "tp", None))
+            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                log.info("%s – trail: R=%.2f, move SL to %.2f (locked +%.1fR)",
+                         symbol, current_r, target_sl, lock_rr)
+            else:
+                log.warning("%s – trail SL modify failed: %s", symbol, res)
+
+
+
 
 # ---------------------------------------------------------------------------
 # Core execution
@@ -759,6 +913,187 @@ def monitor_crsi_and_execute(strategy_id: int,
         conn.close()
         shutdown_mt5()
 
+def monitor_sr30_and_execute(
+    strategy_id: int,
+    per_position_eur: float,
+    *,
+    pivot_left: int = 3,
+    pivot_right: int = 3,
+    min_buffer_pct: float = 0.10,    # floor buffer in %
+    atr_buffer_mult: float = 0.20,   # additional buffer = ATR% * this
+    use_atr_buffer: bool = True,
+    use_volume_filter: bool = True,
+    vol_mult: float = 1.5,           # spike vs median
+    vol_lookback: int = 40,
+    confirm_close: bool = True,      # only act on CLOSED M30 breakout candle
+    rr: float = 2.0,
+    poll_seconds: int = 15,
+    session_start: str = "15:30",
+    session_end: str   = "22:00",
+):
+    """
+    Intraday (M30) breakout watcher with optional volume spike & ATR-based buffer.
+    Entry: price > resistance * (1 + buffer)
+      - buffer = max(min_buffer_pct, ATR% * atr_buffer_mult) if use_atr_buffer else min_buffer_pct
+    SL: nearest support; TP: entry + rr*(entry - SL)
+    """
+    initialize_mt5()
+    conn = get_conn()
+    try:
+        log.info("S/R M30 watcher: strat=%d €%.2f/pos L%d/R%d buffer>=%.3f%% atr_mult=%.2f vol=%s x%.2f/%d close=%s",
+                 strategy_id, per_position_eur, pivot_left, pivot_right, min_buffer_pct, atr_buffer_mult,
+                 use_volume_filter, vol_mult, vol_lookback, confirm_close)
+
+        eurusd_bid = _eurusd_bid()
+
+        while True:
+            if not _in_session_paris(session_start, session_end):
+                time.sleep(poll_seconds); continue
+
+            queue = fetch_pending_queue(conn, strategy_id)
+            log.info("Queue (strat %d): %s", strategy_id, ", ".join(q["ticker"] for q in queue) or "—")
+            if not queue:
+                time.sleep(poll_seconds); continue
+
+            for row in queue:
+                sym = normalize_symbol(row["ticker"])
+                if not (mt5.symbol_info(sym) and mt5.symbol_info(sym).visible):
+                    if not mt5.symbol_select(sym, True):
+                        log.warning("%s – symbol_select failed; skip.", sym); continue
+
+                rates = get_m30_rates(sym, bars=600)
+                if not rates:
+                    log.warning("%s – no M30 bars; skip.", sym); continue
+
+                res, sup = _pivot_levels_from_rates(rates, pivot_left, pivot_right)
+                if not res or not sup or sup >= res:
+                    update_queue_crsi(conn, row["id"], float("nan"));  # reuse as last_checked
+                    continue
+
+                # buffer
+                buf_pct = (_atr_buffer_pct(rates, min_buffer_pct, atr_buffer_mult) if use_atr_buffer
+                           else min_buffer_pct)
+                trigger = res * (1.0 + buf_pct / 100.0)
+
+                # price to check: closed candle or live tick
+                if confirm_close:
+                    # act only if the last CLOSED candle's close broke out
+                    last_closed_close = rates[-2]['close']
+                    price_ok = last_closed_close > trigger
+                    entry_price = last_closed_close
+                else:
+                    tick = mt5.symbol_info_tick(sym)
+                    px = (tick.last or tick.bid or tick.ask) if tick else None
+                    if not px: continue
+                    price_ok = px > trigger
+                    entry_price = px
+
+                # optional volume spike on the breakout bar
+                if use_volume_filter and price_ok:
+                    if not _vol_spike_ok(rates, mult=vol_mult, lookback=vol_lookback, confirm_close=confirm_close):
+                        price_ok = False
+
+                if not price_ok:
+                    update_queue_crsi(conn, row["id"], float("nan"))
+                    continue
+
+                # dedupe
+                if _has_open_position(sym, 99):
+                    log.info("%s – already open (magic=99).", sym)
+                    mark_queue_entered(conn, row["id"], float("nan"))
+                    continue
+
+                sl, tp = _sl_tp_from_support(entry_price, sup, rr=rr)
+                if sl >= entry_price or tp <= entry_price:
+                    continue
+
+                info = mt5.symbol_info(sym)
+                if not info: continue
+                contract = info.trade_contract_size
+                budget_q = eur_to_profit(per_position_eur, info, eurusd_bid)
+                raw_vol  = budget_q / (entry_price * contract)
+                qty      = round_down(raw_vol, info.volume_step)
+                if qty < info.volume_min:
+                    log.warning("%s – qty < min; skip", sym); continue
+
+                req = {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "symbol": sym,
+                    "volume": qty,
+                    "type": mt5.ORDER_TYPE_BUY,
+                    "deviation": 10,
+                    "type_filling": mt5.ORDER_FILLING_IOC,
+                    "magic": 99,
+                    "comment": "sr30-breakout",
+                    "sl": sl,
+                    "tp": tp,
+                }
+                res_send = mt5.order_send(req)
+                if res_send is None or res_send.retcode != mt5.TRADE_RETCODE_DONE:
+                    log.error("%s – order failed %s", sym, res_send); continue
+
+                fill = res_send.price or entry_price
+                log.info("ENTER %s %.4g @ %.5f | SL %.2f TP %.2f | buf=%.3f%% vol=%s",
+                         sym, qty, fill, sl, tp, buf_pct, "Y" if use_volume_filter else "N")
+
+                # record
+                c = conn.cursor()
+                c.execute("""
+                    INSERT INTO open_trades
+                        (ticker, entry_price, stop_loss, target_price, date_opened,
+                         strategy_id, executed, execution_price, execution_time)
+                    VALUES (?, ?, ?, ?, ?, ?, 1, ?, CURRENT_TIMESTAMP)
+                """, (row["ticker"], float(fill), float(sl), float(tp),
+                      _today_paris_str(), strategy_id, float(fill)))
+                conn.commit()
+
+                mark_queue_entered(conn, row["id"], float("nan"))
+                time.sleep(0.2)
+
+            # after processing entries for each symbol in queue, add:
+            try:
+                # run trailing check on all queued symbols we might hold
+                for row in queue:
+                    sym = normalize_symbol(row["ticker"])
+                    if _has_open_position(sym, 99):
+                        maybe_trail_position(conn, row["ticker"], sym,
+                                            rr_trigger=2.0,   # make configurable if you like
+                                            lock_rr=0.5,     # lock +0.5R
+                                            magic=99)
+            except Exception as e:
+                log.warning("Trailing pass error: %s", e)
+
+            time.sleep(poll_seconds)
+    finally:
+        conn.close()
+        shutdown_mt5()
+
+def manage_trailing_stops(strategy_id: int, *, rr_trigger: float = 2.0, lock_rr: float = 0.5, poll_seconds: int = 20):
+    """
+    Standalone loop that updates SLs to lock profits once R >= rr_trigger.
+    """
+    initialize_mt5()
+    conn = get_conn()
+    try:
+        log.info("Trailing manager start: strat=%d, trigger=%.1fR lock=%.1fR", strategy_id, rr_trigger, lock_rr)
+        while True:
+            # read current open tickers for this strategy from DB
+            c = conn.cursor()
+            c.execute("""
+                SELECT DISTINCT ticker FROM open_trades
+                WHERE strategy_id = ? AND executed=1
+            """, (strategy_id,))
+            rows = c.fetchall()
+            for (ticker,) in rows:
+                sym = normalize_symbol(ticker)
+                if _has_open_position(sym, 99):
+                    maybe_trail_position(conn, ticker, sym,
+                                         rr_trigger=rr_trigger, lock_rr=lock_rr, magic=99)
+            time.sleep(poll_seconds)
+    finally:
+        conn.close()
+        shutdown_mt5()
+
 
 # ---------------------------------------------------------------------------
 # CLI entry
@@ -797,8 +1132,28 @@ if __name__ == "__main__":
                    help="Paris time HH:MM when watcher starts acting.")
     p.add_argument("--session-end", default="22:00",
                    help="Paris time HH:MM when watcher stops acting.")
+    
+    modes.add_argument("--watch-sr30", action="store_true",
+    help="Watch M30 S/R breakout (optional ATR buffer and volume spike).")
+
+    modes.add_argument("--no-atr-buffer", action="store_true", help="Disable ATR-based extra buffer.")
+    modes.add_argument("--no-volume-filter", action="store_true", help="Disable volume spike filter.")
+    modes.add_argument("--vol-mult", type=float, default=1.5, help="Volume spike multiple vs median (default 1.5).")
+    modes.add_argument("--vol-lookback", type=int, default=40, help="Median volume lookback bars (default 40).")
+    modes.add_argument("--confirm-close", action="store_true",
+        help="Only enter on CLOSED M30 candle breakout (safer, fewer signals).")
+    modes.add_argument("--rr", type=float, default=2.0, help="Reward:risk multiple for TP (default 2.0).")
+
 
     args = p.parse_args()
+
+    modes.add_argument("--trail", action="store_true",
+        help="Run trailing stop manager (no entries).")
+    modes.add_argument("--trail-trigger", type=float, default=2.0,
+        help="R multiple to trigger trailing (default 2.0).")
+    modes.add_argument("--trail-lock", type=float, default=0.5,
+        help="R multiple to lock at trigger (default 0.5R).")
+
 
     if args.close_only:
         close_strategy_positions(
@@ -817,6 +1172,28 @@ if __name__ == "__main__":
             session_start=args.session_start,
             session_end=args.session_end,
         )
+    
+    elif args.watch_sr30:
+        monitor_sr30_and_execute(
+            args.strategy_id,
+            per_position_eur=args.per_pos_eur,
+            use_atr_buffer=not args.no_atr_buffer,
+            use_volume_filter=not args.no_volume_filter,
+            vol_mult=args.vol_mult,
+            vol_lookback=args.vol_lookback,
+            confirm_close=args.confirm_close,
+            rr=args.rr,
+            poll_seconds=args.poll,
+            session_start=args.session_start,
+            session_end=args.session_end,
+        )
+
+    elif args.trail:
+        manage_trailing_stops(args.strategy_id,
+                            rr_trigger=args.trail_trigger,
+                            lock_rr=args.trail_lock,
+                            poll_seconds=args.poll)
+
 
     else:
         # Open-now path (legacy / immediate open)
@@ -826,3 +1203,5 @@ if __name__ == "__main__":
             even_bet=args.even_bet,
             override_capital=args.capital,
         )
+
+    
