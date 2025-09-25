@@ -134,7 +134,14 @@ def initialize_database():
     """)
 
     # ── Signal Queue (watchlist for Connors RSI triggers) ─────────────────────
+
+    
     cursor.execute("""
+                   
+    ALTER TABLE open_trades ADD COLUMN executed INTEGER DEFAULT 0;
+    ALTER TABLE open_trades ADD COLUMN execution_price REAL;
+    ALTER TABLE open_trades ADD COLUMN execution_time TEXT;
+                   
     CREATE TABLE IF NOT EXISTS signal_queue (
         id           INTEGER PRIMARY KEY AUTOINCREMENT,
         ticker       TEXT        NOT NULL,
