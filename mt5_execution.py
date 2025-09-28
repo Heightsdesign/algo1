@@ -1113,6 +1113,9 @@ if __name__ == "__main__":
                        help="Do not open anything; close positions for this strategy.")
     modes.add_argument("--watch-crsi", action="store_true",
                        help="Run the CRSI watcher on M30 and enter when CRSI<threshold.")
+    modes.add_argument("--watch-sr30", action="store_true",
+    help="Watch M30 S/R breakout (optional ATR buffer and volume spike).")
+
     # (implicit default if none selected: open-now via execute_strategy)
 
     # ===== close params =====
@@ -1133,9 +1136,7 @@ if __name__ == "__main__":
     p.add_argument("--session-end", default="22:00",
                    help="Paris time HH:MM when watcher stops acting.")
     
-    modes.add_argument("--watch-sr30", action="store_true",
-    help="Watch M30 S/R breakout (optional ATR buffer and volume spike).")
-
+    
     modes.add_argument("--no-atr-buffer", action="store_true", help="Disable ATR-based extra buffer.")
     modes.add_argument("--no-volume-filter", action="store_true", help="Disable volume spike filter.")
     modes.add_argument("--vol-mult", type=float, default=1.5, help="Volume spike multiple vs median (default 1.5).")
@@ -1153,6 +1154,13 @@ if __name__ == "__main__":
         help="R multiple to trigger trailing (default 2.0).")
     modes.add_argument("--trail-lock", type=float, default=0.5,
         help="R multiple to lock at trigger (default 0.5R).")
+
+    p.add_argument("--rr", type=float, default=2.0, help="Reward:risk multiple for TP (default 2.0)")
+    p.add_argument("--no-atr-buffer", action="store_true")
+    p.add_argument("--no-volume-filter", action="store_true")
+    p.add_argument("--vol-mult", type=float, default=1.5)
+    p.add_argument("--vol-lookback", type=int, default=40)
+    p.add_argument("--confirm-close", action="store_true")
 
 
     if args.close_only:
