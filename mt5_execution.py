@@ -1102,20 +1102,21 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("strategy_id", type=int)
 
-    # sizing/common
+    # ===== common sizing =====
     p.add_argument("--leverage", type=float, default=1.0)
-    p.add_argument("--capital" , type=float, help="Override account equity")
+    p.add_argument("--capital", type=float, help="Override account equity")
     p.add_argument("--even-bet", action="store_true", default=True)
 
-    # ===== execution modes =====
+    # ===== execution modes (mutually exclusive) =====
     modes = p.add_mutually_exclusive_group()
     modes.add_argument("--close-only", action="store_true",
                        help="Do not open anything; close positions for this strategy.")
     modes.add_argument("--watch-crsi", action="store_true",
                        help="Run the CRSI watcher on M30 and enter when CRSI<threshold.")
     modes.add_argument("--watch-sr30", action="store_true",
-    help="Watch M30 S/R breakout (optional ATR buffer and volume spike).")
-
+                       help="Watch M30 S/R breakout (optional ATR buffer and volume spike).")
+    modes.add_argument("--trail", action="store_true",
+                       help="Run trailing stop manager (no entries).")
     # (implicit default if none selected: open-now via execute_strategy)
 
     # ===== close params =====
@@ -1124,44 +1125,41 @@ if __name__ == "__main__":
     p.add_argument("--close-deviation", type=int, default=10,
                    help="Max price deviation (points) for close orders.")
 
-    # ===== CRSI watcher params =====
-    p.add_argument("--per-pos-eur", type=float, default=40.0,
-                   help="Budget in EUR per position for CRSI entries.")
-    p.add_argument("--crsi-threshold", type=float, default=30.0,
-                   help="Enter when Connors RSI (M30) falls below this value.")
+    # ===== watcher/shared runtime params =====
     p.add_argument("--poll", type=int, default=60,
-                   help="Polling interval in seconds for the CRSI watcher.")
+                   help="Polling interval in seconds for watchers.")
     p.add_argument("--session-start", default="15:30",
                    help="Paris time HH:MM when watcher starts acting.")
     p.add_argument("--session-end", default="22:00",
                    help="Paris time HH:MM when watcher stops acting.")
-    
-    
-    modes.add_argument("--no-atr-buffer", action="store_true", help="Disable ATR-based extra buffer.")
-    modes.add_argument("--no-volume-filter", action="store_true", help="Disable volume spike filter.")
-    modes.add_argument("--vol-mult", type=float, default=1.5, help="Volume spike multiple vs median (default 1.5).")
-    modes.add_argument("--vol-lookback", type=int, default=40, help="Median volume lookback bars (default 40).")
-    modes.add_argument("--confirm-close", action="store_true",
-        help="Only enter on CLOSED M30 candle breakout (safer, fewer signals).")
-    modes.add_argument("--rr", type=float, default=2.0, help="Reward:risk multiple for TP (default 2.0).")
 
+    # ===== CRSI watcher params =====
+    p.add_argument("--per-pos-eur", type=float, default=40.0,
+                   help="Budget in EUR per position for entries.")
+    p.add_argument("--crsi-threshold", type=float, default=30.0,
+                   help="Enter when Connors RSI (M30) falls below this value.")
+
+    # ===== SR30 watcher params (NOT in modes!) =====
+    p.add_argument("--rr", type=float, default=2.0,
+                   help="Reward:risk multiple for TP (default 2.0)")
+    p.add_argument("--no-atr-buffer", action="store_true",
+                   help="Disable ATR-based extra buffer.")
+    p.add_argument("--no-volume-filter", action="store_true",
+                   help="Disable volume spike filter.")
+    p.add_argument("--vol-mult", type=float, default=1.5,
+                   help="Volume spike multiple vs median (default 1.5).")
+    p.add_argument("--vol-lookback", type=int, default=40,
+                   help="Median volume lookback bars (default 40).")
+    p.add_argument("--confirm-close", action="store_true",
+                   help="Only enter on CLOSED M30 candle breakout (safer, fewer signals).")
+
+    # ===== trailing manager params =====
+    p.add_argument("--trail-trigger", type=float, default=2.0,
+                   help="R multiple to trigger trailing (default 2.0).")
+    p.add_argument("--trail-lock", type=float, default=0.5,
+                   help="R multiple to lock at trigger (default 0.5R).")
 
     args = p.parse_args()
-
-    modes.add_argument("--trail", action="store_true",
-        help="Run trailing stop manager (no entries).")
-    modes.add_argument("--trail-trigger", type=float, default=2.0,
-        help="R multiple to trigger trailing (default 2.0).")
-    modes.add_argument("--trail-lock", type=float, default=0.5,
-        help="R multiple to lock at trigger (default 0.5R).")
-
-    p.add_argument("--rr", type=float, default=2.0, help="Reward:risk multiple for TP (default 2.0)")
-    p.add_argument("--no-atr-buffer", action="store_true")
-    p.add_argument("--no-volume-filter", action="store_true")
-    p.add_argument("--vol-mult", type=float, default=1.5)
-    p.add_argument("--vol-lookback", type=int, default=40)
-    p.add_argument("--confirm-close", action="store_true")
-
 
     if args.close_only:
         close_strategy_positions(
@@ -1171,7 +1169,6 @@ if __name__ == "__main__":
         )
 
     elif args.watch_crsi:
-        # CRSI intraday entry loop (one order per symbol when CRSI<threshold)
         monitor_crsi_and_execute(
             args.strategy_id,
             per_position_eur=args.per_pos_eur,
@@ -1180,7 +1177,7 @@ if __name__ == "__main__":
             session_start=args.session_start,
             session_end=args.session_end,
         )
-    
+
     elif args.watch_sr30:
         monitor_sr30_and_execute(
             args.strategy_id,
@@ -1197,11 +1194,12 @@ if __name__ == "__main__":
         )
 
     elif args.trail:
-        manage_trailing_stops(args.strategy_id,
-                            rr_trigger=args.trail_trigger,
-                            lock_rr=args.trail_lock,
-                            poll_seconds=args.poll)
-
+        manage_trailing_stops(
+            args.strategy_id,
+            rr_trigger=args.trail_trigger,
+            lock_rr=args.trail_lock,
+            poll_seconds=args.poll,
+        )
 
     else:
         # Open-now path (legacy / immediate open)
@@ -1211,5 +1209,6 @@ if __name__ == "__main__":
             even_bet=args.even_bet,
             override_capital=args.capital,
         )
+
 
     
