@@ -240,9 +240,21 @@ def get_m30_rates(symbol: str, bars: int = 600):
         if not mt5.symbol_select(symbol, True):
             log.warning("%s – cannot add to Market Watch.", symbol)
             return None
-    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M30, 0, bars)
-    # convert numpy to list of dicts with keys like 'time','open','high','low','close','tick_volume'
-    return rates if (rates is not None and len(rates) >= 60) else None
+    rates_np = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M30, 0, bars)
+    if rates_np is None or len(rates_np) == 0:
+        return None
+    # convert numpy recarray -> list[dict]
+    out = []
+    for r in rates_np:
+        out.append({
+            "time": int(r["time"]),
+            "open": float(r["open"]),
+            "high": float(r["high"]),
+            "low":  float(r["low"]),
+            "close": float(r["close"]),
+            "tick_volume": int(r["tick_volume"]),
+        })
+    return out
 
 def _pivot_levels_from_rates(rates, left: int = 3, right: int = 3):
     highs = [r['high'] for r in rates]
@@ -962,8 +974,10 @@ def monitor_sr30_and_execute(
                         log.warning("%s – symbol_select failed; skip.", sym); continue
 
                 rates = get_m30_rates(sym, bars=600)
-                if not rates:
-                    log.warning("%s – no M30 bars; skip.", sym); continue
+                if rates is None or len(rates) < 60:   # or whatever minimum you need
+                    log.warning("%s – insufficient M30 bars; skip.", sym)
+                    continue
+
 
                 res, sup = _pivot_levels_from_rates(rates, pivot_left, pivot_right)
                 if not res or not sup or sup >= res:
