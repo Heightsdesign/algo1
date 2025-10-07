@@ -964,8 +964,12 @@ def monitor_sr30_and_execute(
 
             queue = fetch_pending_queue(conn, strategy_id)
             log.info("Queue (strat %d): %s", strategy_id, ", ".join(q["ticker"] for q in queue) or "—")
+
             if not queue:
-                time.sleep(poll_seconds); continue
+                log.info("No queue for today; idle.")
+                time.sleep(poll_seconds)
+                continue
+
 
             for row in queue:
                 sym = normalize_symbol(row["ticker"])
