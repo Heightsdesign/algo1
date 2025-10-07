@@ -82,7 +82,16 @@ conn.commit(); conn.close()
 print(f"Seeded {ins}/{len(tickers)} for {today}.")
 "@
 
-  & $PY - << $seed 2>&1 | Tee-Object -FilePath $LOG -Append
+  # write seed to a temporary .py file (PowerShell-safe)
+  $seedPath = Join-Path $env:TEMP ("seed_queue_{0}.py" -f ([Guid]::NewGuid().ToString("N")))
+  Set-Content -Path $seedPath -Value $seed -Encoding UTF8 -Force
+
+  # run it
+  & $PY $seedPath 2>&1 | Tee-Object -FilePath $LOG -Append
+
+  # cleanup
+  Remove-Item $seedPath -ErrorAction SilentlyContinue
+
   Log "PREP OK"
   Stop-Transcript | Out-Null
   exit 0

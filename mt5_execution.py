@@ -240,12 +240,23 @@ def get_m30_rates(symbol: str, bars: int = 600):
         if not mt5.symbol_select(symbol, True):
             log.warning("%s – cannot add to Market Watch.", symbol)
             return None
-    rates_np = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M30, 0, bars)
-    if rates_np is None or len(rates_np) == 0:
-        return None
+    # when loading:
+    rates_np = mt5.copy_rates_from_pos(...); 
+    if rates_np is None or len(rates_np) == 0: return None
+    rates = [{"time": int(r["time"]), "open": float(r["open"]), "high": float(r["high"]),
+            "low": float(r["low"]), "close": float(r["close"]), "tick_volume": int(r["tick_volume"])}
+            for r in rates_np]
+
+    #
+
     # convert numpy recarray -> list[dict]
     out = []
     for r in rates_np:
+
+        if rates is None or len(rates) < 60:
+            log.warning("%s – insufficient M30 bars; skip.", sym)
+            continue
+        
         out.append({
             "time": int(r["time"]),
             "open": float(r["open"]),
