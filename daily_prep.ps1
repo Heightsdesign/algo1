@@ -81,8 +81,8 @@ for t in tickers:
 conn.commit(); conn.close()
 print(f"Seeded {ins}/{len(tickers)} for {today}.")
 "@
-  & $PY - << $seed 2>&1 | Tee-Object -FilePath $LOG -Append
 
+  & $PY - << $seed 2>&1 | Tee-Object -FilePath $LOG -Append
   Log "PREP OK"
   Stop-Transcript | Out-Null
   exit 0
